@@ -95,6 +95,14 @@ pub fn initialize_available_targets() {
         LLVMInitializeAVRAsmParser
     );
     init_target!(
+        llvm_component = "p2",
+        LLVMInitializeP2TargetInfo,
+        LLVMInitializeP2Target,
+        LLVMInitializeP2TargetMC,
+        LLVMInitializeP2AsmPrinter,
+        LLVMInitializeP2AsmParser
+    );
+    init_target!(
         llvm_component = "m68k",
         LLVMInitializeM68kTargetInfo,
         LLVMInitializeM68kTarget,

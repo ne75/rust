@@ -7,8 +7,6 @@
   "target-endian": "little",
   "executables": true,
   "linker-flavor": "ld.lld",
-  "linker-script": "p2.ld",
-  "max_atomic_width": "32",
 
   "position-independent-executables": false,
   "exe-suffix": ".elf",

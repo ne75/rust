@@ -25,6 +25,7 @@ mod wasm;
 mod x86;
 mod x86_64;
 mod x86_win64;
+mod p2;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, HashStable_Generic)]
 pub enum PassMode {
@@ -685,6 +686,7 @@ impl<'a, Ty> FnAbi<'a, Ty> {
             "powerpc64" => powerpc64::compute_abi_info(cx, self),
             "s390x" => s390x::compute_abi_info(cx, self),
             "msp430" => msp430::compute_abi_info(self),
+            "p2" => p2::compute_abi_info(self),
             "sparc" => sparc::compute_abi_info(cx, self),
             "sparc64" => sparc64::compute_abi_info(cx, self),
             "nvptx" => nvptx::compute_abi_info(self),

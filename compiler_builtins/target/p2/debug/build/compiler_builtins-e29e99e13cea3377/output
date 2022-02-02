@@ -1,0 +1,2 @@
+cargo:rustc-flags=-L.
+cargo:rustc-link-lib=static=compiler_builtins

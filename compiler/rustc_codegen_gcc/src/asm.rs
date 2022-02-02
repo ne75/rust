@@ -561,6 +561,7 @@ fn reg_to_gcc(reg: InlineAsmRegOrRegClass) -> ConstraintOrRegister {
             InlineAsmRegClass::Mips(MipsInlineAsmRegClass::reg) => unimplemented!(),
             InlineAsmRegClass::Mips(MipsInlineAsmRegClass::freg) => unimplemented!(),
             InlineAsmRegClass::Msp430(_) => unimplemented!(),
+            InlineAsmRegClass::P2(_) => unimplemented!(),
             InlineAsmRegClass::Nvptx(NvptxInlineAsmRegClass::reg16) => unimplemented!(),
             InlineAsmRegClass::Nvptx(NvptxInlineAsmRegClass::reg32) => unimplemented!(),
             InlineAsmRegClass::Nvptx(NvptxInlineAsmRegClass::reg64) => unimplemented!(),

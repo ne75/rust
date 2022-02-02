@@ -1,0 +1,1 @@
+/Users/nikita/Github/rust/library/compiler_builtins/target/p2/debug/libcompiler_builtins.rlib: /Users/nikita/Github/rust/library/compiler_builtins/build.rs /Users/nikita/Github/rust/library/compiler_builtins/src/lib.rs

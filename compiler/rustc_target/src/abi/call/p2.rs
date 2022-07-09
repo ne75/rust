@@ -1,6 +1,6 @@
 use crate::abi::call::{ArgAbi, FnAbi};
 
-// Match LLVM. 
+// Match LLVM.
 // for 32 or 64 bit non-aggregate types, we can pass via registers. less than 32 bits should be extended to 32 bits
 // for aggegrate types, pass them indirectly.
 // for non-aggregate types > 64 bits, pass them indirectly

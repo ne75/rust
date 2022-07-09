@@ -91,7 +91,6 @@ def_regs! {
         outb: reg = ["outb"],
         ina:  reg = ["ina"],
         inb:  reg = ["inb"],
-    
     }
 }
 

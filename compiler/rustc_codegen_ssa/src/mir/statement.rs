@@ -6,9 +6,8 @@ use crate::traits::BuilderMethods;
 use crate::traits::*;
 
 impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
+    #[instrument(level = "debug", skip(self, bx))]
     pub fn codegen_statement(&mut self, mut bx: Bx, statement: &mir::Statement<'tcx>) -> Bx {
-        debug!("codegen_statement(statement={:?})", statement);
-
         self.set_debug_loc(&mut bx, statement.source_info);
         match statement.kind {
             mir::StatementKind::Assign(box (ref place, ref rvalue)) => {
@@ -46,6 +45,12 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             mir::StatementKind::SetDiscriminant { box ref place, variant_index } => {
                 self.codegen_place(&mut bx, place.as_ref())
                     .codegen_set_discr(&mut bx, variant_index);
+                bx
+            }
+            mir::StatementKind::Deinit(..) => {
+                // For now, don't codegen this to anything. In the future it may be worth
+                // experimenting with what kind of information we can emit to LLVM without hurting
+                // perf here
                 bx
             }
             mir::StatementKind::StorageLive(local) => {

@@ -2,10 +2,9 @@
 mod tests;
 
 use crate::cmp;
-use crate::convert::{TryFrom, TryInto};
 use crate::ffi::CString;
 use crate::fmt;
-use crate::io::{self, Error, ErrorKind, IoSlice, IoSliceMut};
+use crate::io::{self, ErrorKind, IoSlice, IoSliceMut};
 use crate::mem;
 use crate::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr};
 use crate::ptr;
@@ -58,21 +57,36 @@ cfg_if::cfg_if! {
 // sockaddr and misc bindings
 ////////////////////////////////////////////////////////////////////////////////
 
-pub fn setsockopt<T>(sock: &Socket, opt: c_int, val: c_int, payload: T) -> io::Result<()> {
+pub fn setsockopt<T>(
+    sock: &Socket,
+    level: c_int,
+    option_name: c_int,
+    option_value: T,
+) -> io::Result<()> {
     unsafe {
-        let payload = &payload as *const T as *const c_void;
-        cvt(c::setsockopt(sock.as_raw(), opt, val, payload, mem::size_of::<T>() as c::socklen_t))?;
+        cvt(c::setsockopt(
+            sock.as_raw(),
+            level,
+            option_name,
+            &option_value as *const T as *const _,
+            mem::size_of::<T>() as c::socklen_t,
+        ))?;
         Ok(())
     }
 }
 
-pub fn getsockopt<T: Copy>(sock: &Socket, opt: c_int, val: c_int) -> io::Result<T> {
+pub fn getsockopt<T: Copy>(sock: &Socket, level: c_int, option_name: c_int) -> io::Result<T> {
     unsafe {
-        let mut slot: T = mem::zeroed();
-        let mut len = mem::size_of::<T>() as c::socklen_t;
-        cvt(c::getsockopt(sock.as_raw(), opt, val, &mut slot as *mut _ as *mut _, &mut len))?;
-        assert_eq!(len as usize, mem::size_of::<T>());
-        Ok(slot)
+        let mut option_value: T = mem::zeroed();
+        let mut option_len = mem::size_of::<T>() as c::socklen_t;
+        cvt(c::getsockopt(
+            sock.as_raw(),
+            level,
+            option_name,
+            &mut option_value as *mut T as *mut _,
+            &mut option_len,
+        ))?;
+        Ok(option_value)
     }
 }
 
@@ -102,7 +116,7 @@ pub fn sockaddr_to_addr(storage: &c::sockaddr_storage, len: usize) -> io::Result
                 *(storage as *const _ as *const c::sockaddr_in6)
             })))
         }
-        _ => Err(Error::new_const(ErrorKind::InvalidInput, &"invalid argument")),
+        _ => Err(io::const_io_error!(ErrorKind::InvalidInput, "invalid argument")),
     }
 }
 
@@ -165,7 +179,7 @@ impl TryFrom<&str> for LookupHost {
             ($e:expr, $msg:expr) => {
                 match $e {
                     Some(r) => r,
-                    None => return Err(io::Error::new_const(io::ErrorKind::InvalidInput, &$msg)),
+                    None => return Err(io::const_io_error!(io::ErrorKind::InvalidInput, $msg)),
                 }
             };
         }
@@ -384,8 +398,20 @@ impl TcpListener {
         let (addrp, len) = addr.into_inner();
         cvt(unsafe { c::bind(sock.as_raw(), addrp, len as _) })?;
 
+        cfg_if::cfg_if! {
+            if #[cfg(target_os = "horizon")] {
+                // The 3DS doesn't support a big connection backlog. Sometimes
+                // it allows up to about 37, but other times it doesn't even
+                // accept 32. There may be a global limitation causing this.
+                let backlog = 20;
+            } else {
+                // The default for all other platforms
+                let backlog = 128;
+            }
+        }
+
         // Start listening
-        cvt(unsafe { c::listen(sock.as_raw(), 128) })?;
+        cvt(unsafe { c::listen(sock.as_raw(), backlog) })?;
         Ok(TcpListener { inner: sock })
     }
 

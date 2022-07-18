@@ -23,12 +23,13 @@ declare_clippy_lint! {
     /// complexity.
     ///
     /// ### Example
-    /// ```rust,ignore
-    /// // Bad
-    /// let a = (|| 42)()
+    /// ```rust
+    /// let a = (|| 42)();
+    /// ```
     ///
-    /// // Good
-    /// let a = 42
+    /// Use instead:
+    /// ```rust
+    /// let a = 42;
     /// ```
     #[clippy::version = "pre 1.29.0"]
     pub REDUNDANT_CLOSURE_CALL,
@@ -68,7 +69,7 @@ impl EarlyLintPass for RedundantClosureCall {
         if_chain! {
             if let ast::ExprKind::Call(ref paren, _) = expr.kind;
             if let ast::ExprKind::Paren(ref closure) = paren.kind;
-            if let ast::ExprKind::Closure(_, _, _, ref decl, ref block, _) = closure.kind;
+            if let ast::ExprKind::Closure(_, _, _, _, ref decl, ref block, _) = closure.kind;
             then {
                 let mut visitor = ReturnVisitor::new();
                 visitor.visit_expr(block);
@@ -134,7 +135,7 @@ impl<'tcx> LateLintPass<'tcx> for RedundantClosureCall {
             if_chain! {
                 if let hir::StmtKind::Local(local) = w[0].kind;
                 if let Option::Some(t) = local.init;
-                if let hir::ExprKind::Closure(..) = t.kind;
+                if let hir::ExprKind::Closure { .. } = t.kind;
                 if let hir::PatKind::Binding(_, _, ident, _) = local.pat.kind;
                 if let hir::StmtKind::Semi(second) = w[1].kind;
                 if let hir::ExprKind::Assign(_, call, _) = second.kind;

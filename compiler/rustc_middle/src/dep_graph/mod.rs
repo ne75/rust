@@ -12,7 +12,7 @@ pub use rustc_query_system::dep_graph::{
 };
 
 pub use dep_node::{label_strs, DepKind, DepKindStruct, DepNode, DepNodeExt};
-crate use dep_node::{make_compile_codegen_unit, make_compile_mono_item};
+pub(crate) use dep_node::{make_compile_codegen_unit, make_compile_mono_item};
 
 pub type DepGraph = rustc_query_system::dep_graph::DepGraph<DepKind>;
 pub type TaskDeps = rustc_query_system::dep_graph::TaskDeps<DepKind>;
@@ -23,6 +23,7 @@ pub type EdgeFilter = rustc_query_system::dep_graph::debug::EdgeFilter<DepKind>;
 
 impl rustc_query_system::dep_graph::DepKind for DepKind {
     const NULL: Self = DepKind::Null;
+    const RED: Self = DepKind::Red;
 
     fn debug_node(node: &DepNode, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}(", node.kind)?;
@@ -61,7 +62,7 @@ impl rustc_query_system::dep_graph::DepKind for DepKind {
         OP: for<'a> FnOnce(TaskDepsRef<'a>),
     {
         ty::tls::with_context_opt(|icx| {
-            let icx = if let Some(icx) = icx { icx } else { return };
+            let Some(icx) = icx else { return };
             op(icx.task_deps)
         })
     }
@@ -71,8 +72,8 @@ impl<'tcx> DepContext for TyCtxt<'tcx> {
     type DepKind = DepKind;
 
     #[inline]
-    fn create_stable_hashing_context(&self) -> StableHashingContext<'_> {
-        TyCtxt::create_stable_hashing_context(*self)
+    fn with_stable_hashing_context<R>(&self, f: impl FnOnce(StableHashingContext<'_>) -> R) -> R {
+        TyCtxt::with_stable_hashing_context(*self, f)
     }
 
     #[inline]

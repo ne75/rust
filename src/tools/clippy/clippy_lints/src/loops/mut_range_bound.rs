@@ -43,7 +43,7 @@ fn mut_warn_with_span(cx: &LateContext<'_>, span: Option<Span>) {
 fn check_for_mutability(cx: &LateContext<'_>, bound: &Expr<'_>) -> Option<HirId> {
     if_chain! {
         if let Some(hir_id) = path_to_local(bound);
-        if let Node::Binding(pat) = cx.tcx.hir().get(hir_id);
+        if let Node::Pat(pat) = cx.tcx.hir().get(hir_id);
         if let PatKind::Binding(BindingAnnotation::Mutable, ..) = pat.kind;
         then {
             return Some(hir_id);
@@ -114,7 +114,7 @@ impl<'tcx> Delegate<'tcx> for MutatePairDelegate<'_, 'tcx> {
         }
     }
 
-    fn fake_read(&mut self, _: rustc_typeck::expr_use_visitor::Place<'tcx>, _: FakeReadCause, _: HirId) {}
+    fn fake_read(&mut self, _: &rustc_typeck::expr_use_visitor::PlaceWithHirId<'tcx>, _: FakeReadCause, _: HirId) {}
 }
 
 impl MutatePairDelegate<'_, '_> {

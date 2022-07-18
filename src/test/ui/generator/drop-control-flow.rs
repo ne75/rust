@@ -1,8 +1,5 @@
 // build-pass
-
-// FIXME(eholk): temporarily disabled while drop range tracking is disabled
-// (see generator_interior.rs:27)
-// ignore-test
+// compile-flags: -Zdrop-tracking
 
 // A test to ensure generators capture values that were conditionally dropped,
 // and also that values that are dropped along all paths to a yield do not get
@@ -114,6 +111,22 @@ fn nested_loop() {
     };
 }
 
+fn loop_continue(b: bool) {
+    let _ = || {
+        let mut arr = [Ptr];
+        let mut count = 0;
+        drop(arr);
+        while count < 3 {
+            count += 1;
+            yield;
+            if b {
+                arr = [Ptr];
+                continue;
+            }
+        }
+    };
+}
+
 fn main() {
     one_armed_if(true);
     if_let(Some(41));
@@ -122,4 +135,5 @@ fn main() {
     reinit();
     loop_uninit();
     nested_loop();
+    loop_continue(true);
 }

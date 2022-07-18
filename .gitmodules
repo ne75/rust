@@ -34,7 +34,7 @@
 [submodule "src/llvm-project"]
 	path = src/llvm-project
 	url = https://github.com/ne75/llvm-project.git
-	branch = rust
+	branch = master
 [submodule "src/doc/embedded-book"]
 	path = src/doc/embedded-book
 	url = https://github.com/rust-embedded/book.git

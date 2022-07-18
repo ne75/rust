@@ -18,6 +18,7 @@ use crate::check::FnCtxt;
 use hir::def_id::DefId;
 use hir::{Body, HirId, HirIdMap, Node};
 use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::stable_set::FxHashSet;
 use rustc_hir as hir;
 use rustc_index::bit_set::BitSet;
 use rustc_index::vec::IndexVec;
@@ -37,21 +38,37 @@ pub fn compute_drop_ranges<'a, 'tcx>(
     def_id: DefId,
     body: &'tcx Body<'tcx>,
 ) -> DropRanges {
-    let consumed_borrowed_places = find_consumed_and_borrowed(fcx, def_id, body);
+    if fcx.sess().opts.unstable_opts.drop_tracking {
+        let consumed_borrowed_places = find_consumed_and_borrowed(fcx, def_id, body);
 
-    let num_exprs = fcx.tcx.region_scope_tree(def_id).body_expr_count(body.id()).unwrap_or(0);
-    let mut drop_ranges = build_control_flow_graph(
-        fcx.tcx.hir(),
-        fcx.tcx,
-        &fcx.typeck_results.borrow(),
-        consumed_borrowed_places,
-        body,
-        num_exprs,
-    );
+        let typeck_results = &fcx.typeck_results.borrow();
+        let num_exprs = fcx.tcx.region_scope_tree(def_id).body_expr_count(body.id()).unwrap_or(0);
+        let (mut drop_ranges, borrowed_temporaries) = build_control_flow_graph(
+            fcx.tcx.hir(),
+            fcx.tcx,
+            typeck_results,
+            consumed_borrowed_places,
+            body,
+            num_exprs,
+        );
 
-    drop_ranges.propagate_to_fixpoint();
+        drop_ranges.propagate_to_fixpoint();
 
-    DropRanges { tracked_value_map: drop_ranges.tracked_value_map, nodes: drop_ranges.nodes }
+        debug!("borrowed_temporaries = {borrowed_temporaries:?}");
+        DropRanges {
+            tracked_value_map: drop_ranges.tracked_value_map,
+            nodes: drop_ranges.nodes,
+            borrowed_temporaries: Some(borrowed_temporaries),
+        }
+    } else {
+        // If drop range tracking is not enabled, skip all the analysis and produce an
+        // empty set of DropRanges.
+        DropRanges {
+            tracked_value_map: FxHashMap::default(),
+            nodes: IndexVec::new(),
+            borrowed_temporaries: None,
+        }
+    }
 }
 
 /// Applies `f` to consumable node in the HIR subtree pointed to by `place`.
@@ -92,7 +109,7 @@ rustc_index::newtype_index! {
 }
 
 /// Identifies a value whose drop state we need to track.
-#[derive(PartialEq, Eq, Hash, Debug, Clone, Copy)]
+#[derive(PartialEq, Eq, Hash, Clone, Copy)]
 enum TrackedValue {
     /// Represents a named variable, such as a let binding, parameter, or upvar.
     ///
@@ -104,10 +121,37 @@ enum TrackedValue {
     Temporary(HirId),
 }
 
+impl Debug for TrackedValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        ty::tls::with_opt(|opt_tcx| {
+            if let Some(tcx) = opt_tcx {
+                write!(f, "{}", tcx.hir().node_to_string(self.hir_id()))
+            } else {
+                match self {
+                    Self::Variable(hir_id) => write!(f, "Variable({:?})", hir_id),
+                    Self::Temporary(hir_id) => write!(f, "Temporary({:?})", hir_id),
+                }
+            }
+        })
+    }
+}
+
 impl TrackedValue {
     fn hir_id(&self) -> HirId {
         match self {
             TrackedValue::Variable(hir_id) | TrackedValue::Temporary(hir_id) => *hir_id,
+        }
+    }
+
+    fn from_place_with_projections_allowed(place_with_id: &PlaceWithHirId<'_>) -> Self {
+        match place_with_id.place.base {
+            PlaceBase::Rvalue | PlaceBase::StaticItem => {
+                TrackedValue::Temporary(place_with_id.hir_id)
+            }
+            PlaceBase::Local(hir_id)
+            | PlaceBase::Upvar(ty::UpvarId { var_path: ty::UpvarPath { hir_id }, .. }) => {
+                TrackedValue::Variable(hir_id)
+            }
         }
     }
 }
@@ -119,7 +163,7 @@ enum TrackedValueConversionError {
     /// Place projects are not currently supported.
     ///
     /// The reasoning around these is kind of subtle, so we choose to be more
-    /// conservative around these for now. There is not reason in theory we
+    /// conservative around these for now. There is no reason in theory we
     /// cannot support these, we just have not implemented it yet.
     PlaceProjectionsNotSupported,
 }
@@ -136,21 +180,14 @@ impl TryFrom<&PlaceWithHirId<'_>> for TrackedValue {
             return Err(TrackedValueConversionError::PlaceProjectionsNotSupported);
         }
 
-        match place_with_id.place.base {
-            PlaceBase::Rvalue | PlaceBase::StaticItem => {
-                Ok(TrackedValue::Temporary(place_with_id.hir_id))
-            }
-            PlaceBase::Local(hir_id)
-            | PlaceBase::Upvar(ty::UpvarId { var_path: ty::UpvarPath { hir_id }, .. }) => {
-                Ok(TrackedValue::Variable(hir_id))
-            }
-        }
+        Ok(TrackedValue::from_place_with_projections_allowed(place_with_id))
     }
 }
 
 pub struct DropRanges {
     tracked_value_map: FxHashMap<TrackedValue, TrackedValueIndex>,
     nodes: IndexVec<PostOrderId, NodeInfo>,
+    borrowed_temporaries: Option<FxHashSet<HirId>>,
 }
 
 impl DropRanges {
@@ -162,6 +199,10 @@ impl DropRanges {
             .map_or(false, |tracked_value_id| {
                 self.expect_node(location.into()).drop_state.contains(tracked_value_id)
             })
+    }
+
+    pub fn is_borrowed_temporary(&self, expr: &hir::Expr<'_>) -> bool {
+        if let Some(b) = &self.borrowed_temporaries { b.contains(&expr.hir_id) } else { true }
     }
 
     /// Returns a reference to the NodeInfo for a node, panicking if it does not exist
@@ -181,7 +222,7 @@ struct DropRangesBuilder {
     /// NodeInfo struct for more details, but this information includes things
     /// such as the set of control-flow successors, which variables are dropped
     /// or reinitialized, and whether each variable has been inferred to be
-    /// known-dropped or potentially reintiialized at each point.
+    /// known-dropped or potentially reinitialized at each point.
     nodes: IndexVec<PostOrderId, NodeInfo>,
     /// We refer to values whose drop state we are tracking by the HirId of
     /// where they are defined. Within a NodeInfo, however, we store the
@@ -236,7 +277,7 @@ impl DropRangesBuilder {
 
     fn add_control_edge(&mut self, from: PostOrderId, to: PostOrderId) {
         trace!("adding control edge from {:?} to {:?}", from, to);
-        self.node_mut(from.into()).successors.push(to.into());
+        self.node_mut(from).successors.push(to);
     }
 }
 

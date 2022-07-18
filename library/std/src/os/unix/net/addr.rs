@@ -17,8 +17,8 @@ mod libc {
 
 fn sun_path_offset(addr: &libc::sockaddr_un) -> usize {
     // Work with an actual instance of the type since using a null pointer is UB
-    let base = addr as *const _ as usize;
-    let path = &addr.sun_path as *const _ as usize;
+    let base = (addr as *const libc::sockaddr_un).addr();
+    let path = (&addr.sun_path as *const libc::c_char).addr();
     path - base
 }
 
@@ -30,16 +30,16 @@ pub(super) fn sockaddr_un(path: &Path) -> io::Result<(libc::sockaddr_un, libc::s
     let bytes = path.as_os_str().as_bytes();
 
     if bytes.contains(&0) {
-        return Err(io::Error::new_const(
+        return Err(io::const_io_error!(
             io::ErrorKind::InvalidInput,
-            &"paths must not contain interior null bytes",
+            "paths must not contain interior null bytes",
         ));
     }
 
     if bytes.len() >= addr.sun_path.len() {
-        return Err(io::Error::new_const(
+        return Err(io::const_io_error!(
             io::ErrorKind::InvalidInput,
-            &"path must be shorter than SUN_LEN",
+            "path must be shorter than SUN_LEN",
         ));
     }
     // SAFETY: `bytes` and `addr.sun_path` are not overlapping and
@@ -86,7 +86,7 @@ impl<'a> fmt::Display for AsciiEscaped<'a> {
 /// let socket = match UnixListener::bind("/tmp/sock") {
 ///     Ok(sock) => sock,
 ///     Err(e) => {
-///         println!("Couldn't bind: {:?}", e);
+///         println!("Couldn't bind: {e:?}");
 ///         return
 ///     }
 /// };
@@ -121,9 +121,9 @@ impl SocketAddr {
             // linux returns zero bytes of address
             len = sun_path_offset(&addr) as libc::socklen_t; // i.e., zero-length address
         } else if addr.sun_family != libc::AF_UNIX as libc::sa_family_t {
-            return Err(io::Error::new_const(
+            return Err(io::const_io_error!(
                 io::ErrorKind::InvalidInput,
-                &"file descriptor did not correspond to a Unix socket",
+                "file descriptor did not correspond to a Unix socket",
             ));
         }
 
@@ -140,12 +140,11 @@ impl SocketAddr {
     /// # Examples
     ///
     /// ```
-    /// #![feature(unix_socket_creation)]
     /// use std::os::unix::net::SocketAddr;
     /// use std::path::Path;
     ///
     /// # fn main() -> std::io::Result<()> {
-    /// let address = SocketAddr::from_path("/path/to/socket")?;
+    /// let address = SocketAddr::from_pathname("/path/to/socket")?;
     /// assert_eq!(address.as_pathname(), Some(Path::new("/path/to/socket")));
     /// # Ok(())
     /// # }
@@ -154,13 +153,12 @@ impl SocketAddr {
     /// Creating a `SocketAddr` with a NULL byte results in an error.
     ///
     /// ```
-    /// #![feature(unix_socket_creation)]
     /// use std::os::unix::net::SocketAddr;
     ///
-    /// assert!(SocketAddr::from_path("/path/with/\0/bytes").is_err());
+    /// assert!(SocketAddr::from_pathname("/path/with/\0/bytes").is_err());
     /// ```
-    #[unstable(feature = "unix_socket_creation", issue = "93423")]
-    pub fn from_path<P>(path: P) -> io::Result<SocketAddr>
+    #[stable(feature = "unix_socket_creation", since = "1.61.0")]
+    pub fn from_pathname<P>(path: P) -> io::Result<SocketAddr>
     where
         P: AsRef<Path>,
     {
@@ -307,7 +305,7 @@ impl SocketAddr {
     ///     let listener = match UnixListener::bind_addr(&addr) {
     ///         Ok(sock) => sock,
     ///         Err(err) => {
-    ///             println!("Couldn't bind: {:?}", err);
+    ///             println!("Couldn't bind: {err:?}");
     ///             return Err(err);
     ///         }
     ///     };
@@ -323,9 +321,9 @@ impl SocketAddr {
             addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
 
             if namespace.len() + 1 > addr.sun_path.len() {
-                return Err(io::Error::new_const(
+                return Err(io::const_io_error!(
                     io::ErrorKind::InvalidInput,
-                    &"namespace must be shorter than SUN_LEN",
+                    "namespace must be shorter than SUN_LEN",
                 ));
             }
 
@@ -346,7 +344,7 @@ impl fmt::Debug for SocketAddr {
         match self.address() {
             AddressKind::Unnamed => write!(fmt, "(unnamed)"),
             AddressKind::Abstract(name) => write!(fmt, "{} (abstract)", AsciiEscaped(name)),
-            AddressKind::Pathname(path) => write!(fmt, "{:?} (pathname)", path),
+            AddressKind::Pathname(path) => write!(fmt, "{path:?} (pathname)"),
         }
     }
 }

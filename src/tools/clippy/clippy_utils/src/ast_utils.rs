@@ -168,8 +168,8 @@ pub fn eq_expr(l: &Expr, r: &Expr) -> bool {
         (AssignOp(lo, lp, lv), AssignOp(ro, rp, rv)) => lo.node == ro.node && eq_expr(lp, rp) && eq_expr(lv, rv),
         (Field(lp, lf), Field(rp, rf)) => eq_id(*lf, *rf) && eq_expr(lp, rp),
         (Match(ls, la), Match(rs, ra)) => eq_expr(ls, rs) && over(la, ra, eq_arm),
-        (Closure(lc, la, lm, lf, lb, _), Closure(rc, ra, rm, rf, rb, _)) => {
-            lc == rc && la.is_async() == ra.is_async() && lm == rm && eq_fn_decl(lf, rf) && eq_expr(lb, rb)
+        (Closure(lb, lc, la, lm, lf, le, _), Closure(rb, rc, ra, rm, rf, re, _)) => {
+            eq_closure_binder(lb, rb) && lc == rc && la.is_async() == ra.is_async() && lm == rm && eq_fn_decl(lf, rf) && eq_expr(le, re)
         },
         (Async(lc, _, lb), Async(rc, _, rb)) => lc == rc && eq_block(lb, rb),
         (Range(lf, lt, ll), Range(rf, rt, rl)) => ll == rl && eq_expr_opt(lf, rf) && eq_expr_opt(lt, rt),
@@ -242,7 +242,7 @@ pub fn eq_item<K>(l: &Item<K>, r: &Item<K>, mut eq_kind: impl FnMut(&K, &K) -> b
     eq_id(l.ident, r.ident) && over(&l.attrs, &r.attrs, eq_attr) && eq_vis(&l.vis, &r.vis) && eq_kind(&l.kind, &r.kind)
 }
 
-#[allow(clippy::too_many_lines)] // Just a big match statement
+#[expect(clippy::too_many_lines)] // Just a big match statement
 pub fn eq_item_kind(l: &ItemKind, r: &ItemKind) -> bool {
     use ItemKind::*;
     match (l, r) {
@@ -285,12 +285,14 @@ pub fn eq_item_kind(l: &ItemKind, r: &ItemKind) -> bool {
                 generics: lg,
                 bounds: lb,
                 ty: lt,
+                ..
             }),
             TyAlias(box ast::TyAlias {
                 defaultness: rd,
                 generics: rg,
                 bounds: rb,
                 ty: rt,
+                ..
             }),
         ) => {
             eq_defaultness(*ld, *rd)
@@ -388,12 +390,14 @@ pub fn eq_foreign_item_kind(l: &ForeignItemKind, r: &ForeignItemKind) -> bool {
                 generics: lg,
                 bounds: lb,
                 ty: lt,
+                ..
             }),
             TyAlias(box ast::TyAlias {
                 defaultness: rd,
                 generics: rg,
                 bounds: rb,
                 ty: rt,
+                ..
             }),
         ) => {
             eq_defaultness(*ld, *rd)
@@ -432,12 +436,14 @@ pub fn eq_assoc_item_kind(l: &AssocItemKind, r: &AssocItemKind) -> bool {
                 generics: lg,
                 bounds: lb,
                 ty: lt,
+                ..
             }),
             TyAlias(box ast::TyAlias {
                 defaultness: rd,
                 generics: rg,
                 bounds: rb,
                 ty: rt,
+                ..
             }),
         ) => {
             eq_defaultness(*ld, *rd)
@@ -539,7 +545,7 @@ pub fn eq_defaultness(l: Defaultness, r: Defaultness) -> bool {
 pub fn eq_vis(l: &Visibility, r: &Visibility) -> bool {
     use VisibilityKind::*;
     match (&l.kind, &r.kind) {
-        (Public, Public) | (Inherited, Inherited) | (Crate(_), Crate(_)) => true,
+        (Public, Public) | (Inherited, Inherited) => true,
         (Restricted { path: l, .. }, Restricted { path: r, .. }) => eq_path(l, r),
         _ => false,
     }
@@ -553,6 +559,15 @@ pub fn eq_fn_decl(l: &FnDecl, r: &FnDecl) -> bool {
                 && eq_ty(&l.ty, &r.ty)
                 && over(&l.attrs, &r.attrs, eq_attr)
         })
+}
+
+pub fn eq_closure_binder(l: &ClosureBinder, r: &ClosureBinder) -> bool {
+    match (l, r) {
+        (ClosureBinder::NotPresent, ClosureBinder::NotPresent) => true,
+        (ClosureBinder::For { generic_params: lp, .. }, ClosureBinder::For { generic_params: rp, .. }) => 
+            lp.len() == rp.len() && std::iter::zip(lp.iter(), rp.iter()).all(|(l, r)| eq_generic_param(l, r)),
+        _ => false,
+    }
 }
 
 pub fn eq_fn_ret_ty(l: &FnRetTy, r: &FnRetTy) -> bool {
@@ -594,8 +609,8 @@ pub fn eq_ty(l: &Ty, r: &Ty) -> bool {
 pub fn eq_ext(l: &Extern, r: &Extern) -> bool {
     use Extern::*;
     match (l, r) {
-        (None, None) | (Implicit, Implicit) => true,
-        (Explicit(l), Explicit(r)) => eq_str_lit(l, r),
+        (None, None) | (Implicit(_), Implicit(_)) => true,
+        (Explicit(l,_), Explicit(r,_)) => eq_str_lit(l, r),
         _ => false,
     }
 }
@@ -682,7 +697,8 @@ pub fn eq_mac_args(l: &MacArgs, r: &MacArgs) -> bool {
     match (l, r) {
         (Empty, Empty) => true,
         (Delimited(_, ld, lts), Delimited(_, rd, rts)) => ld == rd && lts.eq_unspanned(rts),
-        (Eq(_, lt), Eq(_, rt)) => lt.kind == rt.kind,
+        (Eq(_, MacArgsEq::Ast(le)), Eq(_, MacArgsEq::Ast(re))) => eq_expr(le, re),
+        (Eq(_, MacArgsEq::Hir(ll)), Eq(_, MacArgsEq::Hir(rl))) => ll.kind == rl.kind,
         _ => false,
     }
 }

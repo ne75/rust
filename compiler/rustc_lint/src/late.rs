@@ -34,7 +34,7 @@ use tracing::debug;
 
 /// Extract the `LintStore` from the query context.
 /// This function exists because we've erased `LintStore` as `dyn Any` in the context.
-crate fn unerased_lint_store(tcx: TyCtxt<'_>) -> &LintStore {
+pub fn unerased_lint_store(tcx: TyCtxt<'_>) -> &LintStore {
     let store: &dyn Any = &*tcx.lint_store;
     store.downcast_ref().unwrap()
 }
@@ -59,9 +59,11 @@ impl<'tcx, T: LateLintPass<'tcx>> LateContextAndPass<'tcx, T> {
         let attrs = self.context.tcx.hir().attrs(id);
         let prev = self.context.last_node_with_lint_attrs;
         self.context.last_node_with_lint_attrs = id;
-        self.enter_attrs(attrs);
+        debug!("late context: enter_attrs({:?})", attrs);
+        lint_callback!(self, enter_lint_attrs, attrs);
         f(self);
-        self.exit_attrs(attrs);
+        debug!("late context: exit_attrs({:?})", attrs);
+        lint_callback!(self, exit_lint_attrs, attrs);
         self.context.last_node_with_lint_attrs = prev;
     }
 
@@ -80,16 +82,6 @@ impl<'tcx, T: LateLintPass<'tcx>> LateContextAndPass<'tcx, T> {
         lint_callback!(self, check_mod, m, s, n);
         hir_visit::walk_mod(self, m, n);
         lint_callback!(self, check_mod_post, m, s, n);
-    }
-
-    fn enter_attrs(&mut self, attrs: &'tcx [ast::Attribute]) {
-        debug!("late context: enter_attrs({:?})", attrs);
-        lint_callback!(self, enter_lint_attrs, attrs);
-    }
-
-    fn exit_attrs(&mut self, attrs: &'tcx [ast::Attribute]) {
-        debug!("late context: exit_attrs({:?})", attrs);
-        lint_callback!(self, exit_lint_attrs, attrs);
     }
 }
 
@@ -337,10 +329,8 @@ impl<'tcx, T: LateLintPass<'tcx>> hir_visit::Visitor<'tcx> for LateContextAndPas
         hir_visit::walk_path(self, p);
     }
 
-    fn visit_attribute(&mut self, hir_id: hir::HirId, attr: &'tcx ast::Attribute) {
-        self.with_lint_attrs(hir_id, |cx| {
-            lint_callback!(cx, check_attribute, attr);
-        })
+    fn visit_attribute(&mut self, attr: &'tcx ast::Attribute) {
+        lint_callback!(self, check_attribute, attr);
     }
 }
 
@@ -402,7 +392,7 @@ fn late_lint_mod_pass<'tcx, T: LateLintPass<'tcx>>(
     // Visit the crate attributes
     if hir_id == hir::CRATE_HIR_ID {
         for attr in tcx.hir().attrs(hir::CRATE_HIR_ID).iter() {
-            cx.visit_attribute(hir_id, attr)
+            cx.visit_attribute(attr)
         }
     }
 }
@@ -412,7 +402,7 @@ pub fn late_lint_mod<'tcx, T: LateLintPass<'tcx>>(
     module_def_id: LocalDefId,
     builtin_lints: T,
 ) {
-    if tcx.sess.opts.debugging_opts.no_interleave_lints {
+    if tcx.sess.opts.unstable_opts.no_interleave_lints {
         // These passes runs in late_lint_crate with -Z no_interleave_lints
         return;
     }
@@ -458,7 +448,7 @@ fn late_lint_pass_crate<'tcx, T: LateLintPass<'tcx>>(tcx: TyCtxt<'tcx>, pass: T)
 fn late_lint_crate<'tcx, T: LateLintPass<'tcx>>(tcx: TyCtxt<'tcx>, builtin_lints: T) {
     let mut passes = unerased_lint_store(tcx).late_passes.iter().map(|p| (p)()).collect::<Vec<_>>();
 
-    if !tcx.sess.opts.debugging_opts.no_interleave_lints {
+    if !tcx.sess.opts.unstable_opts.no_interleave_lints {
         if !passes.is_empty() {
             late_lint_pass_crate(tcx, LateLintPassObjects { lints: &mut passes[..] });
         }

@@ -185,12 +185,12 @@ fn take_eof() {
 
     impl Read for R {
         fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
-            Err(io::Error::new_const(io::ErrorKind::Other, &""))
+            Err(io::const_io_error!(io::ErrorKind::Other, ""))
         }
     }
     impl BufRead for R {
         fn fill_buf(&mut self) -> io::Result<&[u8]> {
-            Err(io::Error::new_const(io::ErrorKind::Other, &""))
+            Err(io::const_io_error!(io::ErrorKind::Other, ""))
         }
         fn consume(&mut self, _amt: usize) {}
     }
@@ -423,18 +423,18 @@ fn io_slice_mut_advance_slices() {
 }
 
 #[test]
+#[should_panic]
 fn io_slice_mut_advance_slices_empty_slice() {
     let mut empty_bufs = &mut [][..];
-    // Shouldn't panic.
     IoSliceMut::advance_slices(&mut empty_bufs, 1);
 }
 
 #[test]
+#[should_panic]
 fn io_slice_mut_advance_slices_beyond_total_length() {
     let mut buf1 = [1; 8];
     let mut bufs = &mut [IoSliceMut::new(&mut buf1)][..];
 
-    // Going beyond the total length should be ok.
     IoSliceMut::advance_slices(&mut bufs, 9);
     assert!(bufs.is_empty());
 }
@@ -463,18 +463,18 @@ fn io_slice_advance_slices() {
 }
 
 #[test]
+#[should_panic]
 fn io_slice_advance_slices_empty_slice() {
     let mut empty_bufs = &mut [][..];
-    // Shouldn't panic.
     IoSlice::advance_slices(&mut empty_bufs, 1);
 }
 
 #[test]
+#[should_panic]
 fn io_slice_advance_slices_beyond_total_length() {
     let buf1 = [1; 8];
     let mut bufs = &mut [IoSlice::new(&buf1)][..];
 
-    // Going beyond the total length should be ok.
     IoSlice::advance_slices(&mut bufs, 9);
     assert!(bufs.is_empty());
 }

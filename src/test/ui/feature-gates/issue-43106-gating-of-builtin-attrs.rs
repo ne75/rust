@@ -69,8 +69,8 @@
 #![link_section = "1800"]
 //~^ WARN attribute should be applied to a function or static
 //~^^ WARN this was previously accepted by the compiler
-// see issue-43106-gating-of-rustc_deprecated.rs
 #![must_use]
+//~^ WARN `#[must_use]` has no effect
 // see issue-43106-gating-of-stable.rs
 // see issue-43106-gating-of-unstable.rs
 // see issue-43106-gating-of-deprecated.rs
@@ -580,6 +580,10 @@ mod link {
     //~^ WARN attribute should be applied to an `extern` block
     //~| WARN this was previously accepted
     //~| NOTE not an `extern` block
+
+    #[link()] extern "Rust" {}
+    //~^ WARN attribute should be applied to an `extern` block
+    //~| WARN this was previously accepted
 }
 
 struct StructForDeprecated;
@@ -597,17 +601,17 @@ mod deprecated {
     #[deprecated] impl super::StructForDeprecated { }
 }
 
-#[must_use]
+#[must_use] //~ WARN `#[must_use]` has no effect
 mod must_use {
-    mod inner { #![must_use] }
+    mod inner { #![must_use] } //~ WARN `#[must_use]` has no effect
 
     #[must_use] fn f() { }
 
     #[must_use] struct S;
 
-    #[must_use] type T = S;
+    #[must_use] type T = S; //~ WARN `#[must_use]` has no effect
 
-    #[must_use] impl S { }
+    #[must_use] impl S { } //~ WARN `#[must_use]` has no effect
 }
 
 #[windows_subsystem = "windows"]

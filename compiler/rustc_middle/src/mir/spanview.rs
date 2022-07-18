@@ -243,6 +243,7 @@ pub fn statement_kind_name(statement: &Statement<'_>) -> &'static str {
         Assign(..) => "Assign",
         FakeRead(..) => "FakeRead",
         SetDiscriminant { .. } => "SetDiscriminant",
+        Deinit(..) => "Deinit",
         StorageLive(..) => "StorageLive",
         StorageDead(..) => "StorageDead",
         Retag(..) => "Retag",
@@ -666,7 +667,7 @@ fn trim_span_hi(span: Span, to_pos: BytePos) -> Span {
 fn fn_span<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> Span {
     let fn_decl_span = tcx.def_span(def_id);
     if let Some(body_span) = hir_body(tcx, def_id).map(|hir_body| hir_body.value.span) {
-        if fn_decl_span.ctxt() == body_span.ctxt() { fn_decl_span.to(body_span) } else { body_span }
+        if fn_decl_span.eq_ctxt(body_span) { fn_decl_span.to(body_span) } else { body_span }
     } else {
         fn_decl_span
     }

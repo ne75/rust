@@ -1,13 +1,12 @@
 use rustc_data_structures::temp_dir::MaybeTempDir;
 use rustc_session::cstore::DllImport;
 use rustc_session::Session;
-use rustc_span::symbol::Symbol;
 
 use std::io;
 use std::path::{Path, PathBuf};
 
 pub(super) fn find_library(
-    name: Symbol,
+    name: &str,
     verbatim: bool,
     search_paths: &[PathBuf],
     sess: &Session,
@@ -42,18 +41,15 @@ pub(super) fn find_library(
 }
 
 pub trait ArchiveBuilder<'a> {
-    fn new(sess: &'a Session, output: &Path, input: Option<&Path>) -> Self;
+    fn new(sess: &'a Session, output: &Path) -> Self;
 
     fn add_file(&mut self, path: &Path);
-    fn remove_file(&mut self, name: &str);
-    fn src_files(&mut self) -> Vec<String>;
 
     fn add_archive<F>(&mut self, archive: &Path, skip: F) -> io::Result<()>
     where
         F: FnMut(&str) -> bool + 'static;
-    fn update_symbols(&mut self);
 
-    fn build(self);
+    fn build(self) -> bool;
 
     fn inject_dll_import_lib(
         &mut self,

@@ -25,12 +25,13 @@ declare_clippy_lint! {
     ///
     /// ### Examples
     /// ```rust
-    ///
-    /// // Bad
     /// let foo = "foo";
     /// format!("{}", foo);
+    /// ```
     ///
-    /// // Good
+    /// Use instead:
+    /// ```rust
+    /// let foo = "foo";
     /// foo.to_owned();
     /// ```
     #[clippy::version = "pre 1.29.0"]
@@ -72,7 +73,7 @@ impl<'tcx> LateLintPass<'tcx> for UselessFormat {
             if_chain! {
                 if format_args.format_string_parts == [kw::Empty];
                 if match cx.typeck_results().expr_ty(value).peel_refs().kind() {
-                    ty::Adt(adt, _) => cx.tcx.is_diagnostic_item(sym::String, adt.did),
+                    ty::Adt(adt, _) => cx.tcx.is_diagnostic_item(sym::String, adt.did()),
                     ty::Str => true,
                     _ => false,
                 };
@@ -81,7 +82,7 @@ impl<'tcx> LateLintPass<'tcx> for UselessFormat {
                 then {
                     let is_new_string = match value.kind {
                         ExprKind::Binary(..) => true,
-                        ExprKind::MethodCall(path, ..) => path.ident.name.as_str() == "to_string",
+                        ExprKind::MethodCall(path, ..) => path.ident.name == sym::to_string,
                         _ => false,
                     };
                     let sugg = if format_args.format_string_span.contains(value.span) {

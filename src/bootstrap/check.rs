@@ -20,7 +20,15 @@ fn args(builder: &Builder<'_>) -> Vec<String> {
         arr.iter().copied().map(String::from)
     }
 
-    if let Subcommand::Clippy { fix, .. } = builder.config.cmd {
+    if let Subcommand::Clippy {
+        fix,
+        clippy_lint_allow,
+        clippy_lint_deny,
+        clippy_lint_warn,
+        clippy_lint_forbid,
+        ..
+    } = &builder.config.cmd
+    {
         // disable the most spammy clippy lints
         let ignored_lints = vec![
             "many_single_char_names", // there are a lot in stdarch
@@ -32,7 +40,7 @@ fn args(builder: &Builder<'_>) -> Vec<String> {
             "wrong_self_convention",
         ];
         let mut args = vec![];
-        if fix {
+        if *fix {
             #[rustfmt::skip]
             args.extend(strings(&[
                 "--fix", "-Zunstable-options",
@@ -44,6 +52,12 @@ fn args(builder: &Builder<'_>) -> Vec<String> {
         }
         args.extend(strings(&["--", "--cap-lints", "warn"]));
         args.extend(ignored_lints.iter().map(|lint| format!("-Aclippy::{}", lint)));
+        let mut clippy_lint_levels: Vec<String> = Vec::new();
+        clippy_lint_allow.iter().for_each(|v| clippy_lint_levels.push(format!("-A{}", v)));
+        clippy_lint_deny.iter().for_each(|v| clippy_lint_levels.push(format!("-D{}", v)));
+        clippy_lint_warn.iter().for_each(|v| clippy_lint_levels.push(format!("-W{}", v)));
+        clippy_lint_forbid.iter().for_each(|v| clippy_lint_levels.push(format!("-F{}", v)));
+        args.extend(clippy_lint_levels);
         args
     } else {
         vec![]
@@ -64,7 +78,7 @@ impl Step for Std {
     const DEFAULT: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.all_krates("test")
+        run.all_krates("test").path("library")
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -162,7 +176,7 @@ impl Step for Rustc {
     const DEFAULT: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.all_krates("rustc-main")
+        run.all_krates("rustc-main").path("compiler")
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -184,8 +198,8 @@ impl Step for Rustc {
             // the sysroot for the compiler to find. Otherwise, we're going to
             // fail when building crates that need to generate code (e.g., build
             // scripts and their dependencies).
-            builder.ensure(crate::compile::Std { target: compiler.host, compiler });
-            builder.ensure(crate::compile::Std { target, compiler });
+            builder.ensure(crate::compile::Std::new(compiler, compiler.host));
+            builder.ensure(crate::compile::Std::new(compiler, target));
         } else {
             builder.ensure(Std { target });
         }
@@ -243,12 +257,7 @@ impl Step for CodegenBackend {
     const DEFAULT: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.paths(&[
-            "compiler/rustc_codegen_cranelift",
-            "rustc_codegen_cranelift",
-            "compiler/rustc_codegen_gcc",
-            "rustc_codegen_gcc",
-        ])
+        run.paths(&["compiler/rustc_codegen_cranelift", "compiler/rustc_codegen_gcc"])
     }
 
     fn make_run(run: RunConfig<'_>) {

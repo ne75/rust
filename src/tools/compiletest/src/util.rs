@@ -31,6 +31,7 @@ const OS_TABLE: &[(&str, &str)] = &[
     ("redox", "redox"),
     ("sgx", "sgx"),
     ("solaris", "solaris"),
+    ("watchos", "watchos"),
     ("win32", "windows"),
     ("windows", "windows"),
     ("vxworks", "vxworks"),
@@ -115,6 +116,9 @@ pub const TSAN_SUPPORTED_TARGETS: &[&str] = &[
 ];
 
 pub const HWASAN_SUPPORTED_TARGETS: &[&str] =
+    &["aarch64-linux-android", "aarch64-unknown-linux-gnu"];
+
+pub const MEMTAG_SUPPORTED_TARGETS: &[&str] =
     &["aarch64-linux-android", "aarch64-unknown-linux-gnu"];
 
 const BIG_ENDIAN: &[&str] = &[

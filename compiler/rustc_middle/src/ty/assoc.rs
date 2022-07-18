@@ -9,7 +9,7 @@ use rustc_span::symbol::{Ident, Symbol};
 
 use super::{TyCtxt, Visibility};
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, HashStable, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, HashStable, Hash, Encodable, Decodable)]
 pub enum AssocItemContainer {
     TraitContainer(DefId),
     ImplContainer(DefId),
@@ -41,7 +41,7 @@ impl AssocItemContainer {
 }
 
 /// Information about an associated item
-#[derive(Copy, Clone, Debug, PartialEq, HashStable, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, HashStable, Eq, Hash, Encodable, Decodable)]
 pub struct AssocItem {
     pub def_id: DefId,
     pub name: Symbol,
@@ -81,7 +81,7 @@ impl AssocItem {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Debug, HashStable, Eq, Hash)]
+#[derive(Copy, Clone, PartialEq, Debug, HashStable, Eq, Hash, Encodable, Decodable)]
 pub enum AssocKind {
     Const,
     Fn,
@@ -160,12 +160,11 @@ impl<'tcx> AssocItems<'tcx> {
         &self,
         tcx: TyCtxt<'_>,
         ident: Ident,
+        // Sorted in order of what kinds to look at
         kinds: &[AssocKind],
         parent_def_id: DefId,
     ) -> Option<&ty::AssocItem> {
-        self.filter_by_name_unhygienic(ident.name)
-            .filter(|item| kinds.contains(&item.kind))
-            .find(|item| tcx.hygienic_eq(ident, item.ident(tcx), parent_def_id))
+        kinds.iter().find_map(|kind| self.find_by_name_and_kind(tcx, ident, *kind, parent_def_id))
     }
 
     /// Returns the associated item with the given name in the given `Namespace`, if one exists.

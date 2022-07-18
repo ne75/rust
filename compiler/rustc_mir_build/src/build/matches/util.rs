@@ -8,7 +8,7 @@ use smallvec::SmallVec;
 use std::convert::TryInto;
 
 impl<'a, 'tcx> Builder<'a, 'tcx> {
-    crate fn field_match_pairs<'pat>(
+    pub(crate) fn field_match_pairs<'pat>(
         &mut self,
         place: PlaceBuilder<'tcx>,
         subpatterns: &'pat [FieldPat<'tcx>],
@@ -22,7 +22,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             .collect()
     }
 
-    crate fn prefix_slice_suffix<'pat>(
+    pub(crate) fn prefix_slice_suffix<'pat>(
         &mut self,
         match_pairs: &mut SmallVec<[MatchPair<'pat, 'tcx>; 1]>,
         place: &PlaceBuilder<'tcx>,
@@ -31,21 +31,15 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         suffix: &'pat [Pat<'tcx>],
     ) {
         let tcx = self.tcx;
-        let (min_length, exact_size) = if let Ok(place_resolved) =
-            place.clone().try_upvars_resolved(tcx, self.typeck_results)
-        {
-            match place_resolved
-                .into_place(tcx, self.typeck_results)
-                .ty(&self.local_decls, tcx)
-                .ty
-                .kind()
-            {
-                ty::Array(_, length) => (length.eval_usize(tcx, self.param_env), true),
-                _ => ((prefix.len() + suffix.len()).try_into().unwrap(), false),
-            }
-        } else {
-            ((prefix.len() + suffix.len()).try_into().unwrap(), false)
-        };
+        let (min_length, exact_size) =
+            if let Ok(place_resolved) = place.clone().try_upvars_resolved(self) {
+                match place_resolved.into_place(self).ty(&self.local_decls, tcx).ty.kind() {
+                    ty::Array(_, length) => (length.eval_usize(tcx, self.param_env), true),
+                    _ => ((prefix.len() + suffix.len()).try_into().unwrap(), false),
+                }
+            } else {
+                ((prefix.len() + suffix.len()).try_into().unwrap(), false)
+            };
 
         match_pairs.extend(prefix.iter().enumerate().map(|(idx, subpattern)| {
             let elem =
@@ -79,7 +73,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     /// Creates a false edge to `imaginary_target` and a real edge to
     /// real_target. If `imaginary_target` is none, or is the same as the real
     /// target, a Goto is generated instead to simplify the generated MIR.
-    crate fn false_edges(
+    pub(crate) fn false_edges(
         &mut self,
         from_block: BasicBlock,
         real_target: BasicBlock,
@@ -100,7 +94,14 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
 }
 
 impl<'pat, 'tcx> MatchPair<'pat, 'tcx> {
-    crate fn new(place: PlaceBuilder<'tcx>, pattern: &'pat Pat<'tcx>) -> MatchPair<'pat, 'tcx> {
+    pub(in crate::build) fn new(
+        place: PlaceBuilder<'tcx>,
+        pattern: &'pat Pat<'tcx>,
+    ) -> MatchPair<'pat, 'tcx> {
+        // Force the place type to the pattern's type.
+        // FIXME(oli-obk): only do this when we don't already know the place type.
+        // FIXME(oli-obk): can we use this to simplify slice/array pattern hacks?
+        let place = place.project(ProjectionElem::OpaqueCast(pattern.ty));
         MatchPair { place, pattern }
     }
 }

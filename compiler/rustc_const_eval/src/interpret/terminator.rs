@@ -12,8 +12,8 @@ use rustc_target::abi::call::{ArgAbi, ArgAttribute, ArgAttributes, FnAbi, PassMo
 use rustc_target::spec::abi::Abi;
 
 use super::{
-    FnVal, ImmTy, InterpCx, InterpResult, MPlaceTy, Machine, OpTy, PlaceTy, Scalar,
-    StackPopCleanup, StackPopUnwind,
+    FnVal, ImmTy, Immediate, InterpCx, InterpResult, MPlaceTy, Machine, MemoryKind, OpTy, Operand,
+    PlaceTy, Scalar, StackPopCleanup, StackPopUnwind,
 };
 
 impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
@@ -39,7 +39,8 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 let mut target_block = targets.otherwise();
 
                 for (const_int, target) in targets.iter() {
-                    // Compare using binary_op, to also support pointer values
+                    // Compare using MIR BinOp::Eq, to also support pointer values.
+                    // (Avoiding `self.binary_op` as that does some redundant layout computation.)
                     let res = self
                         .overflowing_binary_op(
                             mir::BinOp::Eq,
@@ -56,7 +57,15 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 self.go_to_block(target_block);
             }
 
-            Call { ref func, ref args, destination, ref cleanup, from_hir_call: _, fn_span: _ } => {
+            Call {
+                ref func,
+                ref args,
+                destination,
+                target,
+                ref cleanup,
+                from_hir_call: _,
+                fn_span: _,
+            } => {
                 let old_stack = self.frame_idx();
                 let old_loc = self.frame().loc;
                 let func = self.eval_operand(func, None)?;
@@ -71,7 +80,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 let (fn_val, fn_abi, with_caller_location) = match *func.layout.ty.kind() {
                     ty::FnPtr(_sig) => {
                         let fn_ptr = self.read_pointer(&func)?;
-                        let fn_val = self.memory.get_fn(fn_ptr)?;
+                        let fn_val = self.get_ptr_fn(fn_ptr)?;
                         (fn_val, self.fn_abi_of_fn_ptr(fn_sig_binder, extra_args)?, false)
                     }
                     ty::FnDef(def_id, substs) => {
@@ -90,20 +99,14 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                     ),
                 };
 
-                let dest_place;
-                let ret = match destination {
-                    Some((dest, ret)) => {
-                        dest_place = self.eval_place(dest)?;
-                        Some((&dest_place, ret))
-                    }
-                    None => None,
-                };
+                let destination = self.eval_place(destination)?;
                 self.eval_fn_call(
                     fn_val,
                     (fn_sig.abi, fn_abi),
                     &args,
                     with_caller_location,
-                    ret,
+                    &destination,
+                    target,
                     match (cleanup, fn_abi.can_unwind) {
                         (Some(cleanup), true) => StackPopUnwind::Cleanup(*cleanup),
                         (None, true) => StackPopUnwind::Skip,
@@ -182,18 +185,33 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 // No question
                 return true;
             }
-            // Compare layout
+            if caller_abi.layout.is_unsized() || callee_abi.layout.is_unsized() {
+                // No, no, no. We require the types to *exactly* match for unsized arguments. If
+                // these are somehow unsized "in a different way" (say, `dyn Trait` vs `[i32]`),
+                // then who knows what happens.
+                return false;
+            }
+            if caller_abi.layout.size != callee_abi.layout.size
+                || caller_abi.layout.align.abi != callee_abi.layout.align.abi
+            {
+                // This cannot go well...
+                return false;
+            }
+            // The rest *should* be okay, but we are extra conservative.
             match (caller_abi.layout.abi, callee_abi.layout.abi) {
                 // Different valid ranges are okay (once we enforce validity,
                 // that will take care to make it UB to leave the range, just
                 // like for transmute).
                 (abi::Abi::Scalar(caller), abi::Abi::Scalar(callee)) => {
-                    caller.value == callee.value
+                    caller.primitive() == callee.primitive()
                 }
                 (
                     abi::Abi::ScalarPair(caller1, caller2),
                     abi::Abi::ScalarPair(callee1, callee2),
-                ) => caller1.value == callee1.value && caller2.value == callee2.value,
+                ) => {
+                    caller1.primitive() == callee1.primitive()
+                        && caller2.primitive() == callee2.primitive()
+                }
                 // Be conservative
                 _ => false,
             }
@@ -274,11 +292,36 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 caller_arg.layout.ty
             )
         }
+        // Special handling for unsized parameters.
+        if caller_arg.layout.is_unsized() {
+            // `check_argument_compat` ensures that both have the same type, so we know they will use the metadata the same way.
+            assert_eq!(caller_arg.layout.ty, callee_arg.layout.ty);
+            // We have to properly pre-allocate the memory for the callee.
+            // So let's tear down some wrappers.
+            // This all has to be in memory, there are no immediate unsized values.
+            let src = caller_arg.assert_mem_place();
+            // The destination cannot be one of these "spread args".
+            let (dest_frame, dest_local) = callee_arg.assert_local();
+            // We are just initializing things, so there can't be anything here yet.
+            assert!(matches!(
+                *self.local_to_op(&self.stack()[dest_frame], dest_local, None)?,
+                Operand::Immediate(Immediate::Uninit)
+            ));
+            // Allocate enough memory to hold `src`.
+            let Some((size, align)) = self.size_and_align_of_mplace(&src)? else {
+                span_bug!(self.cur_span(), "unsized fn arg with `extern` type tail should not be allowed")
+            };
+            let ptr = self.allocate_ptr(size, align, MemoryKind::Stack)?;
+            let dest_place =
+                MPlaceTy::from_aligned_ptr_with_meta(ptr.into(), callee_arg.layout, src.meta);
+            // Update the local to be that new place.
+            *M::access_local_mut(self, dest_frame, dest_local)? = Operand::Indirect(*dest_place);
+        }
         // We allow some transmutes here.
         // FIXME: Depending on the PassMode, this should reset some padding to uninitialized. (This
         // is true for all `copy_op`, but there are a lot of special cases for argument passing
         // specifically.)
-        self.copy_op_transmute(&caller_arg, callee_arg)
+        self.copy_op(&caller_arg, callee_arg, /*allow_transmute*/ true)
     }
 
     /// Call this function -- pushing the stack frame and initializing the arguments.
@@ -295,7 +338,8 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         (caller_abi, caller_fn_abi): (Abi, &FnAbi<'tcx, Ty<'tcx>>),
         args: &[OpTy<'tcx, M::PointerTag>],
         with_caller_location: bool,
-        ret: Option<(&PlaceTy<'tcx, M::PointerTag>, mir::BasicBlock)>,
+        destination: &PlaceTy<'tcx, M::PointerTag>,
+        target: Option<mir::BasicBlock>,
         mut unwind: StackPopUnwind,
     ) -> InterpResult<'tcx> {
         trace!("eval_fn_call: {:#?}", fn_val);
@@ -303,15 +347,23 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         let instance = match fn_val {
             FnVal::Instance(instance) => instance,
             FnVal::Other(extra) => {
-                return M::call_extra_fn(self, extra, caller_abi, args, ret, unwind);
+                return M::call_extra_fn(
+                    self,
+                    extra,
+                    caller_abi,
+                    args,
+                    destination,
+                    target,
+                    unwind,
+                );
             }
         };
 
         match instance.def {
-            ty::InstanceDef::Intrinsic(..) => {
-                assert!(caller_abi == Abi::RustIntrinsic || caller_abi == Abi::PlatformIntrinsic);
+            ty::InstanceDef::Intrinsic(def_id) => {
+                assert!(self.tcx.is_intrinsic(def_id));
                 // caller_fn_abi is not relevant here, we interpret the arguments directly for each intrinsic.
-                M::call_intrinsic(self, instance, args, ret, unwind)
+                M::call_intrinsic(self, instance, args, destination, target, unwind)
             }
             ty::InstanceDef::VtableShim(..)
             | ty::InstanceDef::ReifyShim(..)
@@ -321,23 +373,17 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             | ty::InstanceDef::CloneShim(..)
             | ty::InstanceDef::Item(_) => {
                 // We need MIR for this fn
-                let (body, instance) =
-                    match M::find_mir_or_eval_fn(self, instance, caller_abi, args, ret, unwind)? {
-                        Some(body) => body,
-                        None => return Ok(()),
+                let Some((body, instance)) =
+                    M::find_mir_or_eval_fn(self, instance, caller_abi, args, destination, target, unwind)? else {
+                        return Ok(());
                     };
 
                 // Compute callee information using the `instance` returned by
                 // `find_mir_or_eval_fn`.
-                // FIXME: for variadic support, do we have to somehow determine calle's extra_args?
+                // FIXME: for variadic support, do we have to somehow determine callee's extra_args?
                 let callee_fn_abi = self.fn_abi_of_instance(instance, ty::List::empty())?;
 
-                if callee_fn_abi.c_variadic != caller_fn_abi.c_variadic {
-                    throw_ub_format!(
-                        "calling a c-variadic function via a non-variadic call site, or vice versa"
-                    );
-                }
-                if callee_fn_abi.c_variadic {
+                if callee_fn_abi.c_variadic || caller_fn_abi.c_variadic {
                     throw_unsup_format!("calling a c-variadic function is not supported");
                 }
 
@@ -359,8 +405,8 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 self.push_stack_frame(
                     instance,
                     body,
-                    ret.map(|p| p.0),
-                    StackPopCleanup::Goto { ret: ret.map(|p| p.1), unwind },
+                    destination,
+                    StackPopCleanup::Goto { ret: target, unwind },
                 )?;
 
                 // If an error is raised here, pop the frame again to get an accurate backtrace.
@@ -476,22 +522,47 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             // cannot use the shim here, because that will only result in infinite recursion
             ty::InstanceDef::Virtual(_, idx) => {
                 let mut args = args.to_vec();
-                // We have to implement all "object safe receivers".  Currently we
-                // support built-in pointers `(&, &mut, Box)` as well as unsized-self.  We do
-                // not yet support custom self types.
-                // Also see `compiler/rustc_codegen_llvm/src/abi.rs` and `compiler/rustc_codegen_ssa/src/mir/block.rs`.
-                let receiver_place = match args[0].layout.ty.builtin_deref(true) {
-                    Some(_) => {
-                        // Built-in pointer.
-                        self.deref_operand(&args[0])?
-                    }
-                    None => {
-                        // Unsized self.
-                        args[0].assert_mem_place()
+                // We have to implement all "object safe receivers". So we have to go search for a
+                // pointer or `dyn Trait` type, but it could be wrapped in newtypes. So recursively
+                // unwrap those newtypes until we are there.
+                let mut receiver = args[0];
+                let receiver_place = loop {
+                    match receiver.layout.ty.kind() {
+                        ty::Ref(..) | ty::RawPtr(..) => break self.deref_operand(&receiver)?,
+                        ty::Dynamic(..) => break receiver.assert_mem_place(), // no immediate unsized values
+                        _ => {
+                            // Not there yet, search for the only non-ZST field.
+                            let mut non_zst_field = None;
+                            for i in 0..receiver.layout.fields.count() {
+                                let field = self.operand_field(&receiver, i)?;
+                                if !field.layout.is_zst() {
+                                    assert!(
+                                        non_zst_field.is_none(),
+                                        "multiple non-ZST fields in dyn receiver type {}",
+                                        receiver.layout.ty
+                                    );
+                                    non_zst_field = Some(field);
+                                }
+                            }
+                            receiver = non_zst_field.unwrap_or_else(|| {
+                                panic!(
+                                    "no non-ZST fields in dyn receiver type {}",
+                                    receiver.layout.ty
+                                )
+                            });
+                        }
                     }
                 };
-                // Find and consult vtable
-                let vtable = self.scalar_to_ptr(receiver_place.vtable());
+                // Find and consult vtable. The type now could be something like RcBox<dyn Trait>,
+                // i.e., it is still not necessarily `ty::Dynamic` (so we cannot use
+                // `place.vtable()`), but it should have a `dyn Trait` tail.
+                assert!(matches!(
+                    self.tcx
+                        .struct_tail_erasing_lifetimes(receiver_place.layout.ty, self.param_env)
+                        .kind(),
+                    ty::Dynamic(..)
+                ));
+                let vtable = self.scalar_to_ptr(receiver_place.meta.unwrap_meta())?;
                 let fn_val = self.get_vtable_slot(vtable, u64::try_from(idx).unwrap())?;
 
                 // `*mut receiver_place.layout.ty` is almost the layout that we
@@ -505,14 +576,15 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                     Scalar::from_maybe_pointer(receiver_place.ptr, self).into(),
                     this_receiver_ptr,
                 ));
-                trace!("Patched self operand to {:#?}", args[0]);
+                trace!("Patched receiver operand to {:#?}", args[0]);
                 // recurse with concrete function
                 self.eval_fn_call(
                     fn_val,
                     (caller_abi, caller_fn_abi),
                     &args,
                     with_caller_location,
-                    ret,
+                    destination,
+                    target,
                     unwind,
                 )
             }
@@ -545,16 +617,15 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             place.to_ref(self),
             self.layout_of(self.tcx.mk_mut_ptr(place.layout.ty))?,
         );
-
-        let ty = self.tcx.mk_unit(); // return type is ()
-        let dest = MPlaceTy::dangling(self.layout_of(ty)?);
+        let ret = MPlaceTy::fake_alloc_zst(self.layout_of(self.tcx.types.unit)?);
 
         self.eval_fn_call(
             FnVal::Instance(instance),
             (Abi::Rust, fn_abi),
             &[arg.into()],
             false,
-            Some((&dest.into(), target)),
+            &ret.into(),
+            Some(target),
             match unwind {
                 Some(cleanup) => StackPopUnwind::Cleanup(cleanup),
                 None => StackPopUnwind::Skip,

@@ -4,12 +4,13 @@
 
 use crate::mir::interpret;
 use crate::mir::ProjectionKind;
-use crate::ty::fold::{FallibleTypeFolder, TypeFoldable, TypeVisitor};
+use crate::ty::fold::{FallibleTypeFolder, TypeFoldable, TypeSuperFoldable};
 use crate::ty::print::{with_no_trimmed_paths, FmtPrinter, Printer};
+use crate::ty::visit::{TypeSuperVisitable, TypeVisitable, TypeVisitor};
 use crate::ty::{self, InferConst, Lift, Term, Ty, TyCtxt};
 use rustc_data_structures::functor::IdFunctor;
+use rustc_hir as hir;
 use rustc_hir::def::Namespace;
-use rustc_hir::def_id::CRATE_DEF_INDEX;
 use rustc_index::vec::{Idx, IndexVec};
 
 use std::fmt;
@@ -21,21 +22,27 @@ use std::sync::Arc;
 impl fmt::Debug for ty::TraitDef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         ty::tls::with(|tcx| {
-            with_no_trimmed_paths(|| {
-                FmtPrinter::new(tcx, f, Namespace::TypeNS).print_def_path(self.def_id, &[])
-            })?;
-            Ok(())
+            with_no_trimmed_paths!({
+                f.write_str(
+                    &FmtPrinter::new(tcx, Namespace::TypeNS)
+                        .print_def_path(self.def_id, &[])?
+                        .into_buffer(),
+                )
+            })
         })
     }
 }
 
-impl fmt::Debug for ty::AdtDef {
+impl<'tcx> fmt::Debug for ty::AdtDef<'tcx> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         ty::tls::with(|tcx| {
-            with_no_trimmed_paths(|| {
-                FmtPrinter::new(tcx, f, Namespace::TypeNS).print_def_path(self.did, &[])
-            })?;
-            Ok(())
+            with_no_trimmed_paths!({
+                f.write_str(
+                    &FmtPrinter::new(tcx, Namespace::TypeNS)
+                        .print_def_path(self.did(), &[])?
+                        .into_buffer(),
+                )
+            })
         })
     }
 }
@@ -49,7 +56,7 @@ impl fmt::Debug for ty::UpvarId {
 
 impl<'tcx> fmt::Debug for ty::ExistentialTraitRef<'tcx> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        with_no_trimmed_paths(|| fmt::Display::fmt(self, f))
+        with_no_trimmed_paths!(fmt::Display::fmt(self, f))
     }
 }
 
@@ -64,37 +71,13 @@ impl fmt::Debug for ty::BoundRegionKind {
         match *self {
             ty::BrAnon(n) => write!(f, "BrAnon({:?})", n),
             ty::BrNamed(did, name) => {
-                if did.index == CRATE_DEF_INDEX {
+                if did.is_crate_root() {
                     write!(f, "BrNamed({})", name)
                 } else {
                     write!(f, "BrNamed({:?}, {})", did, name)
                 }
             }
             ty::BrEnv => write!(f, "BrEnv"),
-        }
-    }
-}
-
-impl fmt::Debug for ty::RegionKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            ty::ReEarlyBound(ref data) => write!(f, "ReEarlyBound({}, {})", data.index, data.name),
-
-            ty::ReLateBound(binder_id, ref bound_region) => {
-                write!(f, "ReLateBound({:?}, {:?})", binder_id, bound_region)
-            }
-
-            ty::ReFree(ref fr) => fr.fmt(f),
-
-            ty::ReStatic => write!(f, "ReStatic"),
-
-            ty::ReVar(ref vid) => vid.fmt(f),
-
-            ty::RePlaceholder(placeholder) => write!(f, "RePlaceholder({:?})", placeholder),
-
-            ty::ReEmpty(ui) => write!(f, "ReEmpty({:?})", ui),
-
-            ty::ReErased => write!(f, "ReErased"),
         }
     }
 }
@@ -125,13 +108,13 @@ impl fmt::Debug for ty::RegionVid {
 
 impl<'tcx> fmt::Debug for ty::TraitRef<'tcx> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        with_no_trimmed_paths(|| fmt::Display::fmt(self, f))
+        with_no_trimmed_paths!(fmt::Display::fmt(self, f))
     }
 }
 
 impl<'tcx> fmt::Debug for Ty<'tcx> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        with_no_trimmed_paths(|| fmt::Display::fmt(self, f))
+        with_no_trimmed_paths!(fmt::Display::fmt(self, f))
     }
 }
 
@@ -201,7 +184,7 @@ impl<'tcx> fmt::Debug for ty::PredicateKind<'tcx> {
 // For things that don't carry any arena-allocated data (and are
 // copy...), just add them to this list.
 
-TrivialTypeFoldableAndLiftImpls! {
+TrivialTypeTraversalAndLiftImpls! {
     (),
     bool,
     usize,
@@ -253,6 +236,7 @@ TrivialTypeFoldableAndLiftImpls! {
     crate::ty::UniverseIndex,
     crate::ty::Variance,
     ::rustc_span::Span,
+    ::rustc_errors::ErrorGuaranteed,
 }
 
 ///////////////////////////////////////////////////////////////////////////
@@ -469,7 +453,7 @@ impl<'a, 'tcx> Lift<'tcx> for ty::PredicateKind<'a> {
 
 impl<'a, 'tcx, T: Lift<'tcx>> Lift<'tcx> for ty::Binder<'a, T>
 where
-    <T as Lift<'tcx>>::Lifted: TypeFoldable<'tcx>,
+    <T as Lift<'tcx>>::Lifted: TypeVisitable<'tcx>,
 {
     type Lifted = ty::Binder<'tcx, T::Lifted>;
     fn lift_to_tcx(self, tcx: TyCtxt<'tcx>) -> Option<Self::Lifted> {
@@ -662,38 +646,31 @@ impl<'a, 'tcx> Lift<'tcx> for ty::InstanceDef<'a> {
 
 ///////////////////////////////////////////////////////////////////////////
 // TypeFoldable implementations.
-//
-// Ideally, each type should invoke `folder.fold_foo(self)` and
-// nothing else. In some cases, though, we haven't gotten around to
-// adding methods on the `folder` yet, and thus the folding is
-// hard-coded here. This is less-flexible, because folders cannot
-// override the behavior, but there are a lot of random types and one
-// can easily refactor the folding into the TypeFolder trait as
-// needed.
 
 /// AdtDefs are basically the same as a DefId.
-impl<'tcx> TypeFoldable<'tcx> for &'tcx ty::AdtDef {
-    fn try_super_fold_with<F: FallibleTypeFolder<'tcx>>(
-        self,
-        _folder: &mut F,
-    ) -> Result<Self, F::Error> {
+impl<'tcx> TypeFoldable<'tcx> for ty::AdtDef<'tcx> {
+    fn try_fold_with<F: FallibleTypeFolder<'tcx>>(self, _folder: &mut F) -> Result<Self, F::Error> {
         Ok(self)
     }
+}
 
-    fn super_visit_with<V: TypeVisitor<'tcx>>(&self, _visitor: &mut V) -> ControlFlow<V::BreakTy> {
+impl<'tcx> TypeVisitable<'tcx> for ty::AdtDef<'tcx> {
+    fn visit_with<V: TypeVisitor<'tcx>>(&self, _visitor: &mut V) -> ControlFlow<V::BreakTy> {
         ControlFlow::CONTINUE
     }
 }
 
 impl<'tcx, T: TypeFoldable<'tcx>, U: TypeFoldable<'tcx>> TypeFoldable<'tcx> for (T, U) {
-    fn try_super_fold_with<F: FallibleTypeFolder<'tcx>>(
+    fn try_fold_with<F: FallibleTypeFolder<'tcx>>(
         self,
         folder: &mut F,
     ) -> Result<(T, U), F::Error> {
         Ok((self.0.try_fold_with(folder)?, self.1.try_fold_with(folder)?))
     }
+}
 
-    fn super_visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
+impl<'tcx, T: TypeVisitable<'tcx>, U: TypeVisitable<'tcx>> TypeVisitable<'tcx> for (T, U) {
+    fn visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
         self.0.visit_with(visitor)?;
         self.1.visit_with(visitor)
     }
@@ -702,7 +679,7 @@ impl<'tcx, T: TypeFoldable<'tcx>, U: TypeFoldable<'tcx>> TypeFoldable<'tcx> for 
 impl<'tcx, A: TypeFoldable<'tcx>, B: TypeFoldable<'tcx>, C: TypeFoldable<'tcx>> TypeFoldable<'tcx>
     for (A, B, C)
 {
-    fn try_super_fold_with<F: FallibleTypeFolder<'tcx>>(
+    fn try_fold_with<F: FallibleTypeFolder<'tcx>>(
         self,
         folder: &mut F,
     ) -> Result<(A, B, C), F::Error> {
@@ -712,30 +689,46 @@ impl<'tcx, A: TypeFoldable<'tcx>, B: TypeFoldable<'tcx>, C: TypeFoldable<'tcx>> 
             self.2.try_fold_with(folder)?,
         ))
     }
+}
 
-    fn super_visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
+impl<'tcx, A: TypeVisitable<'tcx>, B: TypeVisitable<'tcx>, C: TypeVisitable<'tcx>>
+    TypeVisitable<'tcx> for (A, B, C)
+{
+    fn visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
         self.0.visit_with(visitor)?;
         self.1.visit_with(visitor)?;
         self.2.visit_with(visitor)
     }
 }
 
-EnumTypeFoldableImpl! {
+EnumTypeTraversalImpl! {
     impl<'tcx, T> TypeFoldable<'tcx> for Option<T> {
         (Some)(a),
         (None),
     } where T: TypeFoldable<'tcx>
 }
+EnumTypeTraversalImpl! {
+    impl<'tcx, T> TypeVisitable<'tcx> for Option<T> {
+        (Some)(a),
+        (None),
+    } where T: TypeVisitable<'tcx>
+}
 
-EnumTypeFoldableImpl! {
+EnumTypeTraversalImpl! {
     impl<'tcx, T, E> TypeFoldable<'tcx> for Result<T, E> {
         (Ok)(a),
         (Err)(a),
     } where T: TypeFoldable<'tcx>, E: TypeFoldable<'tcx>,
 }
+EnumTypeTraversalImpl! {
+    impl<'tcx, T, E> TypeVisitable<'tcx> for Result<T, E> {
+        (Ok)(a),
+        (Err)(a),
+    } where T: TypeVisitable<'tcx>, E: TypeVisitable<'tcx>,
+}
 
 impl<'tcx, T: TypeFoldable<'tcx>> TypeFoldable<'tcx> for Rc<T> {
-    fn try_super_fold_with<F: FallibleTypeFolder<'tcx>>(
+    fn try_fold_with<F: FallibleTypeFolder<'tcx>>(
         mut self,
         folder: &mut F,
     ) -> Result<Self, F::Error> {
@@ -772,14 +765,16 @@ impl<'tcx, T: TypeFoldable<'tcx>> TypeFoldable<'tcx> for Rc<T> {
             Ok(Rc::from_raw(Rc::into_raw(unique).cast()))
         }
     }
+}
 
-    fn super_visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
+impl<'tcx, T: TypeVisitable<'tcx>> TypeVisitable<'tcx> for Rc<T> {
+    fn visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
         (**self).visit_with(visitor)
     }
 }
 
 impl<'tcx, T: TypeFoldable<'tcx>> TypeFoldable<'tcx> for Arc<T> {
-    fn try_super_fold_with<F: FallibleTypeFolder<'tcx>>(
+    fn try_fold_with<F: FallibleTypeFolder<'tcx>>(
         mut self,
         folder: &mut F,
     ) -> Result<Self, F::Error> {
@@ -816,116 +811,117 @@ impl<'tcx, T: TypeFoldable<'tcx>> TypeFoldable<'tcx> for Arc<T> {
             Ok(Arc::from_raw(Arc::into_raw(unique).cast()))
         }
     }
+}
 
-    fn super_visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
+impl<'tcx, T: TypeVisitable<'tcx>> TypeVisitable<'tcx> for Arc<T> {
+    fn visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
         (**self).visit_with(visitor)
     }
 }
 
 impl<'tcx, T: TypeFoldable<'tcx>> TypeFoldable<'tcx> for Box<T> {
-    fn try_super_fold_with<F: FallibleTypeFolder<'tcx>>(
-        self,
-        folder: &mut F,
-    ) -> Result<Self, F::Error> {
+    fn try_fold_with<F: FallibleTypeFolder<'tcx>>(self, folder: &mut F) -> Result<Self, F::Error> {
         self.try_map_id(|value| value.try_fold_with(folder))
     }
+}
 
-    fn super_visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
+impl<'tcx, T: TypeVisitable<'tcx>> TypeVisitable<'tcx> for Box<T> {
+    fn visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
         (**self).visit_with(visitor)
     }
 }
 
 impl<'tcx, T: TypeFoldable<'tcx>> TypeFoldable<'tcx> for Vec<T> {
-    fn try_super_fold_with<F: FallibleTypeFolder<'tcx>>(
-        self,
-        folder: &mut F,
-    ) -> Result<Self, F::Error> {
+    fn try_fold_with<F: FallibleTypeFolder<'tcx>>(self, folder: &mut F) -> Result<Self, F::Error> {
         self.try_map_id(|t| t.try_fold_with(folder))
     }
+}
 
-    fn super_visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
+impl<'tcx, T: TypeVisitable<'tcx>> TypeVisitable<'tcx> for Vec<T> {
+    fn visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
         self.iter().try_for_each(|t| t.visit_with(visitor))
     }
 }
 
 impl<'tcx, T: TypeFoldable<'tcx>> TypeFoldable<'tcx> for Box<[T]> {
-    fn try_super_fold_with<F: FallibleTypeFolder<'tcx>>(
-        self,
-        folder: &mut F,
-    ) -> Result<Self, F::Error> {
+    fn try_fold_with<F: FallibleTypeFolder<'tcx>>(self, folder: &mut F) -> Result<Self, F::Error> {
         self.try_map_id(|t| t.try_fold_with(folder))
     }
+}
 
-    fn super_visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
+impl<'tcx, T: TypeVisitable<'tcx>> TypeVisitable<'tcx> for Box<[T]> {
+    fn visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
         self.iter().try_for_each(|t| t.visit_with(visitor))
     }
 }
 
+impl<'tcx, T: TypeFoldable<'tcx>> TypeFoldable<'tcx> for ty::EarlyBinder<T> {
+    fn try_fold_with<F: FallibleTypeFolder<'tcx>>(self, folder: &mut F) -> Result<Self, F::Error> {
+        self.try_map_bound(|ty| ty.try_fold_with(folder))
+    }
+}
+
+impl<'tcx, T: TypeVisitable<'tcx>> TypeVisitable<'tcx> for ty::EarlyBinder<T> {
+    fn visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
+        self.as_ref().0.visit_with(visitor)
+    }
+}
+
 impl<'tcx, T: TypeFoldable<'tcx>> TypeFoldable<'tcx> for ty::Binder<'tcx, T> {
+    fn try_fold_with<F: FallibleTypeFolder<'tcx>>(self, folder: &mut F) -> Result<Self, F::Error> {
+        folder.try_fold_binder(self)
+    }
+}
+
+impl<'tcx, T: TypeVisitable<'tcx>> TypeVisitable<'tcx> for ty::Binder<'tcx, T> {
+    fn visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
+        visitor.visit_binder(self)
+    }
+}
+
+impl<'tcx, T: TypeFoldable<'tcx>> TypeSuperFoldable<'tcx> for ty::Binder<'tcx, T> {
     fn try_super_fold_with<F: FallibleTypeFolder<'tcx>>(
         self,
         folder: &mut F,
     ) -> Result<Self, F::Error> {
         self.try_map_bound(|ty| ty.try_fold_with(folder))
     }
+}
 
-    fn try_fold_with<F: FallibleTypeFolder<'tcx>>(self, folder: &mut F) -> Result<Self, F::Error> {
-        folder.try_fold_binder(self)
-    }
-
+impl<'tcx, T: TypeVisitable<'tcx>> TypeSuperVisitable<'tcx> for ty::Binder<'tcx, T> {
     fn super_visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
         self.as_ref().skip_binder().visit_with(visitor)
-    }
-
-    fn visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
-        visitor.visit_binder(self)
     }
 }
 
 impl<'tcx> TypeFoldable<'tcx> for &'tcx ty::List<ty::Binder<'tcx, ty::ExistentialPredicate<'tcx>>> {
-    fn try_super_fold_with<F: FallibleTypeFolder<'tcx>>(
-        self,
-        folder: &mut F,
-    ) -> Result<Self, F::Error> {
+    fn try_fold_with<F: FallibleTypeFolder<'tcx>>(self, folder: &mut F) -> Result<Self, F::Error> {
         ty::util::fold_list(self, folder, |tcx, v| tcx.intern_poly_existential_predicates(v))
     }
+}
 
-    fn super_visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
+impl<'tcx> TypeVisitable<'tcx>
+    for &'tcx ty::List<ty::Binder<'tcx, ty::ExistentialPredicate<'tcx>>>
+{
+    fn visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
         self.iter().try_for_each(|p| p.visit_with(visitor))
     }
 }
 
-impl<'tcx> TypeFoldable<'tcx> for &'tcx ty::List<Ty<'tcx>> {
-    fn try_super_fold_with<F: FallibleTypeFolder<'tcx>>(
-        self,
-        folder: &mut F,
-    ) -> Result<Self, F::Error> {
-        ty::util::fold_list(self, folder, |tcx, v| tcx.intern_type_list(v))
-    }
-
-    fn super_visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
-        self.iter().try_for_each(|t| t.visit_with(visitor))
+impl<'tcx> TypeFoldable<'tcx> for &'tcx ty::List<ProjectionKind> {
+    fn try_fold_with<F: FallibleTypeFolder<'tcx>>(self, folder: &mut F) -> Result<Self, F::Error> {
+        ty::util::fold_list(self, folder, |tcx, v| tcx.intern_projs(v))
     }
 }
 
-impl<'tcx> TypeFoldable<'tcx> for &'tcx ty::List<ProjectionKind> {
-    fn try_super_fold_with<F: FallibleTypeFolder<'tcx>>(
-        self,
-        folder: &mut F,
-    ) -> Result<Self, F::Error> {
-        ty::util::fold_list(self, folder, |tcx, v| tcx.intern_projs(v))
-    }
-
-    fn super_visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
+impl<'tcx> TypeVisitable<'tcx> for &'tcx ty::List<ProjectionKind> {
+    fn visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
         self.iter().try_for_each(|t| t.visit_with(visitor))
     }
 }
 
 impl<'tcx> TypeFoldable<'tcx> for ty::instance::Instance<'tcx> {
-    fn try_super_fold_with<F: FallibleTypeFolder<'tcx>>(
-        self,
-        folder: &mut F,
-    ) -> Result<Self, F::Error> {
+    fn try_fold_with<F: FallibleTypeFolder<'tcx>>(self, folder: &mut F) -> Result<Self, F::Error> {
         use crate::ty::InstanceDef::*;
         Ok(Self {
             substs: self.substs.try_fold_with(folder)?,
@@ -950,8 +946,10 @@ impl<'tcx> TypeFoldable<'tcx> for ty::instance::Instance<'tcx> {
             },
         })
     }
+}
 
-    fn super_visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
+impl<'tcx> TypeVisitable<'tcx> for ty::instance::Instance<'tcx> {
+    fn visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
         use crate::ty::InstanceDef::*;
         self.substs.visit_with(visitor)?;
         match self.def {
@@ -973,19 +971,30 @@ impl<'tcx> TypeFoldable<'tcx> for ty::instance::Instance<'tcx> {
 }
 
 impl<'tcx> TypeFoldable<'tcx> for interpret::GlobalId<'tcx> {
-    fn try_super_fold_with<F: FallibleTypeFolder<'tcx>>(
-        self,
-        folder: &mut F,
-    ) -> Result<Self, F::Error> {
+    fn try_fold_with<F: FallibleTypeFolder<'tcx>>(self, folder: &mut F) -> Result<Self, F::Error> {
         Ok(Self { instance: self.instance.try_fold_with(folder)?, promoted: self.promoted })
     }
+}
 
-    fn super_visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
+impl<'tcx> TypeVisitable<'tcx> for interpret::GlobalId<'tcx> {
+    fn visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
         self.instance.visit_with(visitor)
     }
 }
 
 impl<'tcx> TypeFoldable<'tcx> for Ty<'tcx> {
+    fn try_fold_with<F: FallibleTypeFolder<'tcx>>(self, folder: &mut F) -> Result<Self, F::Error> {
+        folder.try_fold_ty(self)
+    }
+}
+
+impl<'tcx> TypeVisitable<'tcx> for Ty<'tcx> {
+    fn visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
+        visitor.visit_ty(*self)
+    }
+}
+
+impl<'tcx> TypeSuperFoldable<'tcx> for Ty<'tcx> {
     fn try_super_fold_with<F: FallibleTypeFolder<'tcx>>(
         self,
         folder: &mut F,
@@ -1029,11 +1038,9 @@ impl<'tcx> TypeFoldable<'tcx> for Ty<'tcx> {
 
         Ok(if *self.kind() == kind { self } else { folder.tcx().mk_ty(kind) })
     }
+}
 
-    fn try_fold_with<F: FallibleTypeFolder<'tcx>>(self, folder: &mut F) -> Result<Self, F::Error> {
-        folder.try_fold_ty(self)
-    }
-
+impl<'tcx> TypeSuperVisitable<'tcx> for Ty<'tcx> {
     fn super_visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
         match self.kind() {
             ty::RawPtr(ref tm) => tm.visit_with(visitor),
@@ -1075,30 +1082,32 @@ impl<'tcx> TypeFoldable<'tcx> for Ty<'tcx> {
             | ty::Foreign(..) => ControlFlow::CONTINUE,
         }
     }
-
-    fn visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
-        visitor.visit_ty(self)
-    }
 }
 
 impl<'tcx> TypeFoldable<'tcx> for ty::Region<'tcx> {
+    fn try_fold_with<F: FallibleTypeFolder<'tcx>>(self, folder: &mut F) -> Result<Self, F::Error> {
+        folder.try_fold_region(self)
+    }
+}
+
+impl<'tcx> TypeVisitable<'tcx> for ty::Region<'tcx> {
+    fn visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
+        visitor.visit_region(*self)
+    }
+}
+
+impl<'tcx> TypeSuperFoldable<'tcx> for ty::Region<'tcx> {
     fn try_super_fold_with<F: FallibleTypeFolder<'tcx>>(
         self,
         _folder: &mut F,
     ) -> Result<Self, F::Error> {
         Ok(self)
     }
+}
 
-    fn try_fold_with<F: FallibleTypeFolder<'tcx>>(self, folder: &mut F) -> Result<Self, F::Error> {
-        folder.try_fold_region(self)
-    }
-
+impl<'tcx> TypeSuperVisitable<'tcx> for ty::Region<'tcx> {
     fn super_visit_with<V: TypeVisitor<'tcx>>(&self, _visitor: &mut V) -> ControlFlow<V::BreakTy> {
         ControlFlow::CONTINUE
-    }
-
-    fn visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
-        visitor.visit_region(*self)
     }
 }
 
@@ -1106,91 +1115,99 @@ impl<'tcx> TypeFoldable<'tcx> for ty::Predicate<'tcx> {
     fn try_fold_with<F: FallibleTypeFolder<'tcx>>(self, folder: &mut F) -> Result<Self, F::Error> {
         folder.try_fold_predicate(self)
     }
+}
 
-    fn try_super_fold_with<F: FallibleTypeFolder<'tcx>>(
-        self,
-        folder: &mut F,
-    ) -> Result<Self, F::Error> {
-        let new = self.inner.kind.try_fold_with(folder)?;
-        Ok(folder.tcx().reuse_or_mk_predicate(self, new))
-    }
-
-    fn super_visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
-        self.inner.kind.visit_with(visitor)
-    }
-
+impl<'tcx> TypeVisitable<'tcx> for ty::Predicate<'tcx> {
     fn visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
         visitor.visit_predicate(*self)
     }
 
     fn has_vars_bound_at_or_above(&self, binder: ty::DebruijnIndex) -> bool {
-        self.inner.outer_exclusive_binder > binder
+        self.outer_exclusive_binder() > binder
     }
 
+    #[inline]
     fn has_type_flags(&self, flags: ty::TypeFlags) -> bool {
-        self.inner.flags.intersects(flags)
+        self.flags().intersects(flags)
     }
 }
 
-impl<'tcx> TypeFoldable<'tcx> for &'tcx ty::List<ty::Predicate<'tcx>> {
+impl<'tcx> TypeSuperFoldable<'tcx> for ty::Predicate<'tcx> {
     fn try_super_fold_with<F: FallibleTypeFolder<'tcx>>(
         self,
         folder: &mut F,
     ) -> Result<Self, F::Error> {
+        let new = self.kind().try_fold_with(folder)?;
+        Ok(folder.tcx().reuse_or_mk_predicate(self, new))
+    }
+}
+
+impl<'tcx> TypeSuperVisitable<'tcx> for ty::Predicate<'tcx> {
+    fn super_visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
+        self.kind().visit_with(visitor)
+    }
+}
+
+impl<'tcx> TypeFoldable<'tcx> for &'tcx ty::List<ty::Predicate<'tcx>> {
+    fn try_fold_with<F: FallibleTypeFolder<'tcx>>(self, folder: &mut F) -> Result<Self, F::Error> {
         ty::util::fold_list(self, folder, |tcx, v| tcx.intern_predicates(v))
     }
+}
 
-    fn super_visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
+impl<'tcx> TypeVisitable<'tcx> for &'tcx ty::List<ty::Predicate<'tcx>> {
+    fn visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
         self.iter().try_for_each(|p| p.visit_with(visitor))
     }
 }
 
 impl<'tcx, T: TypeFoldable<'tcx>, I: Idx> TypeFoldable<'tcx> for IndexVec<I, T> {
-    fn try_super_fold_with<F: FallibleTypeFolder<'tcx>>(
-        self,
-        folder: &mut F,
-    ) -> Result<Self, F::Error> {
+    fn try_fold_with<F: FallibleTypeFolder<'tcx>>(self, folder: &mut F) -> Result<Self, F::Error> {
         self.try_map_id(|x| x.try_fold_with(folder))
     }
+}
 
-    fn super_visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
+impl<'tcx, T: TypeVisitable<'tcx>, I: Idx> TypeVisitable<'tcx> for IndexVec<I, T> {
+    fn visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
         self.iter().try_for_each(|t| t.visit_with(visitor))
     }
 }
 
-impl<'tcx> TypeFoldable<'tcx> for &'tcx ty::Const<'tcx> {
+impl<'tcx> TypeFoldable<'tcx> for ty::Const<'tcx> {
+    fn try_fold_with<F: FallibleTypeFolder<'tcx>>(self, folder: &mut F) -> Result<Self, F::Error> {
+        folder.try_fold_const(self)
+    }
+}
+
+impl<'tcx> TypeVisitable<'tcx> for ty::Const<'tcx> {
+    fn visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
+        visitor.visit_const(*self)
+    }
+}
+
+impl<'tcx> TypeSuperFoldable<'tcx> for ty::Const<'tcx> {
     fn try_super_fold_with<F: FallibleTypeFolder<'tcx>>(
         self,
         folder: &mut F,
     ) -> Result<Self, F::Error> {
-        let ty = self.ty.try_fold_with(folder)?;
-        let val = self.val.try_fold_with(folder)?;
-        if ty != self.ty || val != self.val {
-            Ok(folder.tcx().mk_const(ty::Const { ty, val }))
+        let ty = self.ty().try_fold_with(folder)?;
+        let kind = self.kind().try_fold_with(folder)?;
+        if ty != self.ty() || kind != self.kind() {
+            Ok(folder.tcx().mk_const(ty::ConstS { ty, kind }))
         } else {
             Ok(self)
         }
     }
+}
 
-    fn try_fold_with<F: FallibleTypeFolder<'tcx>>(self, folder: &mut F) -> Result<Self, F::Error> {
-        folder.try_fold_const(self)
-    }
-
+impl<'tcx> TypeSuperVisitable<'tcx> for ty::Const<'tcx> {
     fn super_visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
-        self.ty.visit_with(visitor)?;
-        self.val.visit_with(visitor)
-    }
-
-    fn visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
-        visitor.visit_const(self)
+        self.ty().visit_with(visitor)?;
+        self.kind().visit_with(visitor)
     }
 }
 
 impl<'tcx> TypeFoldable<'tcx> for ty::ConstKind<'tcx> {
-    fn try_super_fold_with<F: FallibleTypeFolder<'tcx>>(
-        self,
-        folder: &mut F,
-    ) -> Result<Self, F::Error> {
+    fn try_fold_with<F: FallibleTypeFolder<'tcx>>(self, folder: &mut F) -> Result<Self, F::Error> {
         Ok(match self {
             ty::ConstKind::Infer(ic) => ty::ConstKind::Infer(ic.try_fold_with(folder)?),
             ty::ConstKind::Param(p) => ty::ConstKind::Param(p.try_fold_with(folder)?),
@@ -1201,8 +1218,10 @@ impl<'tcx> TypeFoldable<'tcx> for ty::ConstKind<'tcx> {
             | ty::ConstKind::Error(_) => self,
         })
     }
+}
 
-    fn super_visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
+impl<'tcx> TypeVisitable<'tcx> for ty::ConstKind<'tcx> {
+    fn visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
         match *self {
             ty::ConstKind::Infer(ic) => ic.visit_with(visitor),
             ty::ConstKind::Param(p) => p.visit_with(visitor),
@@ -1216,19 +1235,30 @@ impl<'tcx> TypeFoldable<'tcx> for ty::ConstKind<'tcx> {
 }
 
 impl<'tcx> TypeFoldable<'tcx> for InferConst<'tcx> {
-    fn try_super_fold_with<F: FallibleTypeFolder<'tcx>>(
-        self,
-        _folder: &mut F,
-    ) -> Result<Self, F::Error> {
+    fn try_fold_with<F: FallibleTypeFolder<'tcx>>(self, _folder: &mut F) -> Result<Self, F::Error> {
         Ok(self)
     }
+}
 
-    fn super_visit_with<V: TypeVisitor<'tcx>>(&self, _visitor: &mut V) -> ControlFlow<V::BreakTy> {
+impl<'tcx> TypeVisitable<'tcx> for InferConst<'tcx> {
+    fn visit_with<V: TypeVisitor<'tcx>>(&self, _visitor: &mut V) -> ControlFlow<V::BreakTy> {
         ControlFlow::CONTINUE
     }
 }
 
 impl<'tcx> TypeFoldable<'tcx> for ty::Unevaluated<'tcx> {
+    fn try_fold_with<F: FallibleTypeFolder<'tcx>>(self, folder: &mut F) -> Result<Self, F::Error> {
+        folder.try_fold_unevaluated(self)
+    }
+}
+
+impl<'tcx> TypeVisitable<'tcx> for ty::Unevaluated<'tcx> {
+    fn visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
+        visitor.visit_unevaluated(*self)
+    }
+}
+
+impl<'tcx> TypeSuperFoldable<'tcx> for ty::Unevaluated<'tcx> {
     fn try_super_fold_with<F: FallibleTypeFolder<'tcx>>(
         self,
         folder: &mut F,
@@ -1239,33 +1269,34 @@ impl<'tcx> TypeFoldable<'tcx> for ty::Unevaluated<'tcx> {
             promoted: self.promoted,
         })
     }
+}
 
-    fn visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
-        visitor.visit_unevaluated_const(*self)
-    }
-
+impl<'tcx> TypeSuperVisitable<'tcx> for ty::Unevaluated<'tcx> {
     fn super_visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
         self.substs.visit_with(visitor)
     }
 }
 
 impl<'tcx> TypeFoldable<'tcx> for ty::Unevaluated<'tcx, ()> {
-    fn try_super_fold_with<F: FallibleTypeFolder<'tcx>>(
-        self,
-        folder: &mut F,
-    ) -> Result<Self, F::Error> {
-        Ok(ty::Unevaluated {
-            def: self.def,
-            substs: self.substs.try_fold_with(folder)?,
-            promoted: self.promoted,
-        })
+    fn try_fold_with<F: FallibleTypeFolder<'tcx>>(self, folder: &mut F) -> Result<Self, F::Error> {
+        Ok(self.expand().try_fold_with(folder)?.shrink())
     }
+}
 
+impl<'tcx> TypeVisitable<'tcx> for ty::Unevaluated<'tcx, ()> {
     fn visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
-        visitor.visit_unevaluated_const(self.expand())
+        self.expand().visit_with(visitor)
     }
+}
 
-    fn super_visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
-        self.substs.visit_with(visitor)
+impl<'tcx> TypeFoldable<'tcx> for hir::Constness {
+    fn try_fold_with<F: FallibleTypeFolder<'tcx>>(self, _: &mut F) -> Result<Self, F::Error> {
+        Ok(self)
+    }
+}
+
+impl<'tcx> TypeVisitable<'tcx> for hir::Constness {
+    fn visit_with<V: TypeVisitor<'tcx>>(&self, _: &mut V) -> ControlFlow<V::BreakTy> {
+        ControlFlow::CONTINUE
     }
 }

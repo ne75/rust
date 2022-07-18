@@ -18,6 +18,11 @@ pub trait PointerArithmetic: HasDataLayout {
         self.data_layout().pointer_size
     }
 
+    #[inline(always)]
+    fn max_size_of_val(&self) -> Size {
+        Size::from_bytes(self.machine_isize_max())
+    }
+
     #[inline]
     fn machine_usize_max(&self) -> u64 {
         self.pointer_size().unsigned_int_max().try_into().unwrap()
@@ -99,7 +104,7 @@ impl<T: HasDataLayout> PointerArithmetic for T {}
 /// mostly opaque; the `Machine` trait extends it with some more operations that also have access to
 /// some global state.
 /// We don't actually care about this `Debug` bound (we use `Provenance::fmt` to format the entire
-/// pointer), but `derive` adds some unecessary bounds.
+/// pointer), but `derive` adds some unnecessary bounds.
 pub trait Provenance: Copy + fmt::Debug {
     /// Says whether the `offset` field of `Pointer`s with this provenance is the actual physical address.
     /// If `true, ptr-to-int casts work by simply discarding the provenance.
@@ -115,9 +120,11 @@ pub trait Provenance: Copy + fmt::Debug {
     where
         Self: Sized;
 
-    /// Provenance must always be able to identify the allocation this ptr points to.
+    /// If `OFFSET_IS_ADDR == false`, provenance must always be able to
+    /// identify the allocation this ptr points to (i.e., this must return `Some`).
+    /// Otherwise this function is best-effort (but must agree with `Machine::ptr_get_alloc`).
     /// (Identifying the offset in that allocation, however, is harder -- use `Memory::ptr_get_alloc` for that.)
-    fn get_alloc_id(self) -> AllocId;
+    fn get_alloc_id(self) -> Option<AllocId>;
 }
 
 impl Provenance for AllocId {
@@ -137,13 +144,13 @@ impl Provenance for AllocId {
         }
         // Print offset only if it is non-zero.
         if ptr.offset.bytes() > 0 {
-            write!(f, "+0x{:x}", ptr.offset.bytes())?;
+            write!(f, "+{:#x}", ptr.offset.bytes())?;
         }
         Ok(())
     }
 
-    fn get_alloc_id(self) -> AllocId {
-        self
+    fn get_alloc_id(self) -> Option<AllocId> {
+        Some(self)
     }
 }
 
@@ -158,6 +165,9 @@ pub struct Pointer<Tag = AllocId> {
 }
 
 static_assert_size!(Pointer, 16);
+// `Option<Tag>` pointers are also passed around quite a bit
+// (but not stored in permanent machine state).
+static_assert_size!(Pointer<Option<AllocId>>, 16);
 
 // We want the `Debug` output to be readable as it is used by `derive(Debug)` for
 // all the Miri types.
@@ -171,7 +181,17 @@ impl<Tag: Provenance> fmt::Debug for Pointer<Option<Tag>> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.provenance {
             Some(tag) => Provenance::fmt(&Pointer::new(tag, self.offset), f),
-            None => write!(f, "0x{:x}", self.offset.bytes()),
+            None => write!(f, "{:#x}[noalloc]", self.offset.bytes()),
+        }
+    }
+}
+
+impl<Tag: Provenance> fmt::Display for Pointer<Option<Tag>> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.provenance.is_none() && self.offset.bytes() == 0 {
+            write!(f, "null pointer")
+        } else {
+            fmt::Debug::fmt(self, f)
         }
     }
 }
@@ -193,18 +213,37 @@ impl<Tag> From<Pointer<Tag>> for Pointer<Option<Tag>> {
 }
 
 impl<Tag> Pointer<Option<Tag>> {
+    /// Convert this pointer that *might* have a tag into a pointer that *definitely* has a tag, or
+    /// an absolute address.
+    ///
+    /// This is rarely what you want; call `ptr_try_get_alloc_id` instead.
     pub fn into_pointer_or_addr(self) -> Result<Pointer<Tag>, Size> {
         match self.provenance {
             Some(tag) => Ok(Pointer::new(tag, self.offset)),
             None => Err(self.offset),
         }
     }
+
+    /// Returns the absolute address the pointer points to.
+    /// Only works if Tag::OFFSET_IS_ADDR is true!
+    pub fn addr(self) -> Size
+    where
+        Tag: Provenance,
+    {
+        assert!(Tag::OFFSET_IS_ADDR);
+        self.offset
+    }
 }
 
 impl<Tag> Pointer<Option<Tag>> {
     #[inline(always)]
+    pub fn from_addr(addr: u64) -> Self {
+        Pointer { provenance: None, offset: Size::from_bytes(addr) }
+    }
+
+    #[inline(always)]
     pub fn null() -> Self {
-        Pointer { provenance: None, offset: Size::ZERO }
+        Pointer::from_addr(0)
     }
 }
 

@@ -1,5 +1,5 @@
 use rustc_data_structures::fx::FxHashSet;
-use rustc_middle::ty::fold::{TypeFoldable, TypeVisitor};
+use rustc_middle::ty::visit::{TypeSuperVisitable, TypeVisitable, TypeVisitor};
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_span::source_map::Span;
 use std::ops::ControlFlow;
@@ -43,7 +43,7 @@ pub fn parameters_for_impl<'tcx>(
 /// of parameters whose values are needed in order to constrain `ty` - these
 /// differ, with the latter being a superset, in the presence of projections.
 pub fn parameters_for<'tcx>(
-    t: &impl TypeFoldable<'tcx>,
+    t: &impl TypeVisitable<'tcx>,
     include_nonconstraining: bool,
 ) -> Vec<Parameter> {
     let mut collector = ParameterCollector { parameters: vec![], include_nonconstraining };
@@ -59,7 +59,7 @@ struct ParameterCollector {
 impl<'tcx> TypeVisitor<'tcx> for ParameterCollector {
     fn visit_ty(&mut self, t: Ty<'tcx>) -> ControlFlow<Self::BreakTy> {
         match *t.kind() {
-            ty::Projection(..) | ty::Opaque(..) if !self.include_nonconstraining => {
+            ty::Projection(..) if !self.include_nonconstraining => {
                 // projections are not injective
                 return ControlFlow::CONTINUE;
             }
@@ -79,11 +79,11 @@ impl<'tcx> TypeVisitor<'tcx> for ParameterCollector {
         ControlFlow::CONTINUE
     }
 
-    fn visit_const(&mut self, c: &'tcx ty::Const<'tcx>) -> ControlFlow<Self::BreakTy> {
-        match c.val {
+    fn visit_const(&mut self, c: ty::Const<'tcx>) -> ControlFlow<Self::BreakTy> {
+        match c.kind() {
             ty::ConstKind::Unevaluated(..) if !self.include_nonconstraining => {
                 // Constant expressions are not injective
-                return c.ty.visit_with(self);
+                return c.ty().visit_with(self);
             }
             ty::ConstKind::Param(data) => {
                 self.parameters.push(Parameter::from(data));
@@ -109,9 +109,9 @@ pub fn identify_constrained_generic_params<'tcx>(
 /// constrained before it is used, if that is possible, and add the
 /// parameters so constrained to `input_parameters`. For example,
 /// imagine the following impl:
-///
-///     impl<T: Debug, U: Iterator<Item = T>> Trait for U
-///
+/// ```ignore (illustrative)
+/// impl<T: Debug, U: Iterator<Item = T>> Trait for U
+/// ```
 /// The impl's predicates are collected from left to right. Ignoring
 /// the implicit `Sized` bounds, these are
 ///   * T: Debug

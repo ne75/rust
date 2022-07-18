@@ -5,9 +5,10 @@
 #![unstable(issue = "none", feature = "windows_c")]
 
 use crate::mem;
-use crate::os::raw::NonZero_c_ulong;
 use crate::os::raw::{c_char, c_int, c_long, c_longlong, c_uint, c_ulong, c_ushort};
+use crate::os::windows::io::{BorrowedHandle, HandleOrInvalid, HandleOrNull};
 use crate::ptr;
+use core::ffi::NonZero_c_ulong;
 
 use libc::{c_void, size_t, wchar_t};
 
@@ -83,11 +84,13 @@ pub const CSTR_GREATER_THAN: c_int = 3;
 pub const FILE_ATTRIBUTE_READONLY: DWORD = 0x1;
 pub const FILE_ATTRIBUTE_DIRECTORY: DWORD = 0x10;
 pub const FILE_ATTRIBUTE_REPARSE_POINT: DWORD = 0x400;
+pub const INVALID_FILE_ATTRIBUTES: DWORD = DWORD::MAX;
 
 pub const FILE_SHARE_DELETE: DWORD = 0x4;
 pub const FILE_SHARE_READ: DWORD = 0x1;
 pub const FILE_SHARE_WRITE: DWORD = 0x2;
 
+pub const FILE_OPEN: ULONG = 0x00000001;
 pub const FILE_OPEN_REPARSE_POINT: ULONG = 0x200000;
 pub const OBJ_DONT_REPARSE: ULONG = 0x1000;
 
@@ -170,7 +173,7 @@ pub const PROGRESS_CONTINUE: DWORD = 0;
 
 pub const E_NOTIMPL: HRESULT = 0x80004001u32 as HRESULT;
 
-pub const INVALID_HANDLE_VALUE: HANDLE = !0 as HANDLE;
+pub const INVALID_HANDLE_VALUE: HANDLE = ptr::invalid_mut(!0);
 
 pub const FACILITY_NT_BIT: DWORD = 0x1000_0000;
 
@@ -271,6 +274,10 @@ pub const STATUS_SUCCESS: NTSTATUS = 0x00000000;
 pub const STATUS_DELETE_PENDING: NTSTATUS = 0xc0000056_u32 as _;
 pub const STATUS_INVALID_PARAMETER: NTSTATUS = 0xc000000d_u32 as _;
 
+pub const STATUS_PENDING: NTSTATUS = 0x103 as _;
+pub const STATUS_END_OF_FILE: NTSTATUS = 0xC0000011_u32 as _;
+pub const STATUS_NOT_IMPLEMENTED: NTSTATUS = 0xC0000002_u32 as _;
+
 // Equivalent to the `NT_SUCCESS` C preprocessor macro.
 // See: https://docs.microsoft.com/en-us/windows-hardware/drivers/kernel/using-ntstatus-values
 pub fn nt_success(status: NTSTATUS) -> bool {
@@ -313,15 +320,45 @@ impl Default for OBJECT_ATTRIBUTES {
     }
 }
 #[repr(C)]
-pub struct IO_STATUS_BLOCK {
-    pub Pointer: *mut c_void,
-    pub Information: usize,
+union IO_STATUS_BLOCK_union {
+    Status: NTSTATUS,
+    Pointer: *mut c_void,
 }
-impl Default for IO_STATUS_BLOCK {
+impl Default for IO_STATUS_BLOCK_union {
     fn default() -> Self {
-        Self { Pointer: ptr::null_mut(), Information: 0 }
+        let mut this = Self { Pointer: ptr::null_mut() };
+        this.Status = STATUS_PENDING;
+        this
     }
 }
+#[repr(C)]
+#[derive(Default)]
+pub struct IO_STATUS_BLOCK {
+    u: IO_STATUS_BLOCK_union,
+    pub Information: usize,
+}
+impl IO_STATUS_BLOCK {
+    pub fn status(&self) -> NTSTATUS {
+        // SAFETY: If `self.u.Status` was set then this is obviously safe.
+        // If `self.u.Pointer` was set then this is the equivalent to converting
+        // the pointer to an integer, which is also safe.
+        // Currently the only safe way to construct `IO_STATUS_BLOCK` outside of
+        // this module is to call the `default` method, which sets the `Status`.
+        unsafe { self.u.Status }
+    }
+}
+
+pub type LPOVERLAPPED_COMPLETION_ROUTINE = unsafe extern "system" fn(
+    dwErrorCode: DWORD,
+    dwNumberOfBytesTransfered: DWORD,
+    lpOverlapped: *mut OVERLAPPED,
+);
+
+type IO_APC_ROUTINE = unsafe extern "system" fn(
+    ApcContext: *mut c_void,
+    IoStatusBlock: *mut IO_STATUS_BLOCK,
+    Reserved: ULONG,
+);
 
 #[repr(C)]
 #[cfg(not(target_pointer_width = "64"))]
@@ -511,15 +548,6 @@ pub struct CONDITION_VARIABLE {
 #[repr(C)]
 pub struct SRWLOCK {
     pub ptr: LPVOID,
-}
-#[repr(C)]
-pub struct CRITICAL_SECTION {
-    CriticalSectionDebug: LPVOID,
-    LockCount: LONG,
-    RecursionCount: LONG,
-    OwningThread: HANDLE,
-    LockSemaphore: HANDLE,
-    SpinCount: ULONG_PTR,
 }
 
 #[repr(C)]
@@ -773,6 +801,10 @@ if #[cfg(not(target_vendor = "uwp"))] {
 
     #[link(name = "advapi32")]
     extern "system" {
+        // Forbidden when targeting UWP
+        #[link_name = "SystemFunction036"]
+        pub fn RtlGenRandom(RandomBuffer: *mut u8, RandomBufferLength: ULONG) -> BOOLEAN;
+
         // Allowed but unused by UWP
         pub fn OpenProcessToken(
             ProcessHandle: HANDLE,
@@ -851,11 +883,6 @@ if #[cfg(target_vendor = "uwp")] {
 #[link(name = "kernel32")]
 extern "system" {
     pub fn GetCurrentProcessId() -> DWORD;
-    pub fn InitializeCriticalSection(CriticalSection: *mut CRITICAL_SECTION);
-    pub fn EnterCriticalSection(CriticalSection: *mut CRITICAL_SECTION);
-    pub fn TryEnterCriticalSection(CriticalSection: *mut CRITICAL_SECTION) -> BOOL;
-    pub fn LeaveCriticalSection(CriticalSection: *mut CRITICAL_SECTION);
-    pub fn DeleteCriticalSection(CriticalSection: *mut CRITICAL_SECTION);
 
     pub fn GetSystemDirectoryW(lpBuffer: LPWSTR, uSize: UINT) -> UINT;
     pub fn RemoveDirectoryW(lpPathName: LPCWSTR) -> BOOL;
@@ -884,10 +911,11 @@ extern "system" {
         lpParameter: LPVOID,
         dwCreationFlags: DWORD,
         lpThreadId: LPDWORD,
-    ) -> HANDLE;
+    ) -> HandleOrNull;
     pub fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: DWORD) -> DWORD;
     pub fn SwitchToThread() -> BOOL;
     pub fn Sleep(dwMilliseconds: DWORD);
+    pub fn SleepEx(dwMilliseconds: DWORD, bAlertable: BOOL) -> DWORD;
     pub fn GetProcessId(handle: HANDLE) -> DWORD;
     pub fn CopyFileExW(
         lpExistingFileName: LPCWSTR,
@@ -948,18 +976,25 @@ extern "system" {
         dwOptions: DWORD,
     ) -> BOOL;
     pub fn ReadFile(
-        hFile: HANDLE,
+        hFile: BorrowedHandle<'_>,
         lpBuffer: LPVOID,
         nNumberOfBytesToRead: DWORD,
         lpNumberOfBytesRead: LPDWORD,
         lpOverlapped: LPOVERLAPPED,
     ) -> BOOL;
-    pub fn WriteFile(
-        hFile: HANDLE,
+    pub fn ReadFileEx(
+        hFile: BorrowedHandle<'_>,
+        lpBuffer: LPVOID,
+        nNumberOfBytesToRead: DWORD,
+        lpOverlapped: LPOVERLAPPED,
+        lpCompletionRoutine: LPOVERLAPPED_COMPLETION_ROUTINE,
+    ) -> BOOL;
+    pub fn WriteFileEx(
+        hFile: BorrowedHandle<'_>,
         lpBuffer: LPVOID,
         nNumberOfBytesToWrite: DWORD,
-        lpNumberOfBytesWritten: LPDWORD,
         lpOverlapped: LPOVERLAPPED,
+        lpCompletionRoutine: LPOVERLAPPED_COMPLETION_ROUTINE,
     ) -> BOOL;
     pub fn CloseHandle(hObject: HANDLE) -> BOOL;
     pub fn MoveFileExW(lpExistingFileName: LPCWSTR, lpNewFileName: LPCWSTR, dwFlags: DWORD)
@@ -979,7 +1014,7 @@ extern "system" {
         dwCreationDisposition: DWORD,
         dwFlagsAndAttributes: DWORD,
         hTemplateFile: HANDLE,
-    ) -> HANDLE;
+    ) -> HandleOrInvalid;
 
     pub fn FindFirstFileW(fileName: LPCWSTR, findFileData: LPWIN32_FIND_DATAW) -> HANDLE;
     pub fn FindNextFileW(findFile: HANDLE, findFileData: LPWIN32_FIND_DATAW) -> BOOL;
@@ -1074,6 +1109,7 @@ extern "system" {
         lpBuffer: LPWSTR,
         lpFilePart: *mut LPWSTR,
     ) -> DWORD;
+    pub fn GetFileAttributesW(lpFileName: LPCWSTR) -> DWORD;
 }
 
 #[link(name = "ws2_32")]
@@ -1228,20 +1264,51 @@ compat_fn! {
 
 compat_fn! {
     "ntdll":
-    pub fn NtOpenFile(
+    pub fn NtCreateFile(
         FileHandle: *mut HANDLE,
         DesiredAccess: ACCESS_MASK,
         ObjectAttributes: *const OBJECT_ATTRIBUTES,
         IoStatusBlock: *mut IO_STATUS_BLOCK,
+        AllocationSize: *mut i64,
+        FileAttributes: ULONG,
         ShareAccess: ULONG,
-        OpenOptions: ULONG
+        CreateDisposition: ULONG,
+        CreateOptions: ULONG,
+        EaBuffer: *mut c_void,
+        EaLength: ULONG
     ) -> NTSTATUS {
-        panic!("`NtOpenFile` not available");
+        STATUS_NOT_IMPLEMENTED
+    }
+    pub fn NtReadFile(
+        FileHandle: BorrowedHandle<'_>,
+        Event: HANDLE,
+        ApcRoutine: Option<IO_APC_ROUTINE>,
+        ApcContext: *mut c_void,
+        IoStatusBlock: &mut IO_STATUS_BLOCK,
+        Buffer: *mut crate::mem::MaybeUninit<u8>,
+        Length: ULONG,
+        ByteOffset: Option<&LARGE_INTEGER>,
+        Key: Option<&ULONG>
+    ) -> NTSTATUS {
+        STATUS_NOT_IMPLEMENTED
+    }
+    pub fn NtWriteFile(
+        FileHandle: BorrowedHandle<'_>,
+        Event: HANDLE,
+        ApcRoutine: Option<IO_APC_ROUTINE>,
+        ApcContext: *mut c_void,
+        IoStatusBlock: &mut IO_STATUS_BLOCK,
+        Buffer: *const u8,
+        Length: ULONG,
+        ByteOffset: Option<&LARGE_INTEGER>,
+        Key: Option<&ULONG>
+    ) -> NTSTATUS {
+        STATUS_NOT_IMPLEMENTED
     }
     pub fn RtlNtStatusToDosError(
         Status: NTSTATUS
     ) -> ULONG {
-        panic!("`RtlNtStatusToDosError` not available");
+        Status as ULONG
     }
     pub fn NtCreateKeyedEvent(
         KeyedEventHandle: LPHANDLE,

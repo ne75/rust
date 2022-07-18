@@ -1,13 +1,25 @@
-var darkThemes = ["dark", "ayu"];
+// storage.js is loaded in the `<head>` of all rustdoc pages and doesn't
+// use `async` or `defer`. That means it blocks further parsing and rendering
+// of the page: https://developer.mozilla.org/en-US/docs/Web/HTML/Element/script.
+// This makes it the correct place to act on settings that affect the display of
+// the page, so we don't see major layout changes during the load of the page.
+"use strict";
+
+const darkThemes = ["dark", "ayu"];
 window.currentTheme = document.getElementById("themeStyle");
 window.mainTheme = document.getElementById("mainThemeStyle");
 
-var settingsDataset = (function () {
-    var settingsElement = document.getElementById("default-settings");
+// WARNING: RUSTDOC_MOBILE_BREAKPOINT MEDIA QUERY
+// If you update this line, then you also need to update the two media queries with the same
+// warning in rustdoc.css
+window.RUSTDOC_MOBILE_BREAKPOINT = 701;
+
+const settingsDataset = (function() {
+    const settingsElement = document.getElementById("default-settings");
     if (settingsElement === null) {
         return null;
     }
-    var dataset = settingsElement.dataset;
+    const dataset = settingsElement.dataset;
     if (dataset === undefined) {
         return null;
     }
@@ -15,14 +27,14 @@ var settingsDataset = (function () {
 })();
 
 function getSettingValue(settingName) {
-    var current = getCurrentValue('rustdoc-' + settingName);
+    const current = getCurrentValue(settingName);
     if (current !== null) {
         return current;
     }
     if (settingsDataset !== null) {
         // See the comment for `default_settings.into_iter()` etc. in
         // `Options::from_matches` in `librustdoc/config.rs`.
-        var def = settingsDataset[settingName.replace(/-/g,'_')];
+        const def = settingsDataset[settingName.replace(/-/g,"_")];
         if (def !== undefined) {
             return def;
         }
@@ -30,9 +42,9 @@ function getSettingValue(settingName) {
     return null;
 }
 
-var localStoredTheme = getSettingValue("theme");
+const localStoredTheme = getSettingValue("theme");
 
-var savedHref = [];
+const savedHref = [];
 
 // eslint-disable-next-line no-unused-vars
 function hasClass(elem, className) {
@@ -63,17 +75,16 @@ function removeClass(elem, className) {
  */
 function onEach(arr, func, reversed) {
     if (arr && arr.length > 0 && func) {
-        var length = arr.length;
-        var i;
         if (reversed) {
-            for (i = length - 1; i >= 0; --i) {
+            const length = arr.length;
+            for (let i = length - 1; i >= 0; --i) {
                 if (func(arr[i])) {
                     return true;
                 }
             }
         } else {
-            for (i = 0; i < length; ++i) {
-                if (func(arr[i])) {
+            for (const elem of arr) {
+                if (func(elem)) {
                     return true;
                 }
             }
@@ -99,48 +110,43 @@ function onEachLazy(lazyArray, func, reversed) {
         reversed);
 }
 
-// eslint-disable-next-line no-unused-vars
-function hasOwnPropertyRustdoc(obj, property) {
-    return Object.prototype.hasOwnProperty.call(obj, property);
-}
-
 function updateLocalStorage(name, value) {
     try {
-        window.localStorage.setItem(name, value);
-    } catch(e) {
+        window.localStorage.setItem("rustdoc-" + name, value);
+    } catch (e) {
         // localStorage is not accessible, do nothing
     }
 }
 
 function getCurrentValue(name) {
     try {
-        return window.localStorage.getItem(name);
-    } catch(e) {
+        return window.localStorage.getItem("rustdoc-" + name);
+    } catch (e) {
         return null;
     }
 }
 
 function switchTheme(styleElem, mainStyleElem, newTheme, saveTheme) {
-    var newHref = mainStyleElem.href.replace(
+    const newHref = mainStyleElem.href.replace(
         /\/rustdoc([^/]*)\.css/, "/" + newTheme + "$1" + ".css");
 
     // If this new value comes from a system setting or from the previously
     // saved theme, no need to save it.
     if (saveTheme) {
-        updateLocalStorage("rustdoc-theme", newTheme);
+        updateLocalStorage("theme", newTheme);
     }
 
     if (styleElem.href === newHref) {
         return;
     }
 
-    var found = false;
+    let found = false;
     if (savedHref.length === 0) {
-        onEachLazy(document.getElementsByTagName("link"), function(el) {
+        onEachLazy(document.getElementsByTagName("link"), el => {
             savedHref.push(el.href);
         });
     }
-    onEach(savedHref, function(el) {
+    onEach(savedHref, el => {
         if (el === newHref) {
             found = true;
             return true;
@@ -158,21 +164,21 @@ function useSystemTheme(value) {
         value = true;
     }
 
-    updateLocalStorage("rustdoc-use-system-theme", value);
+    updateLocalStorage("use-system-theme", value);
 
     // update the toggle if we're on the settings page
-    var toggle = document.getElementById("use-system-theme");
+    const toggle = document.getElementById("use-system-theme");
     if (toggle && toggle instanceof HTMLInputElement) {
         toggle.checked = value;
     }
 }
 
-var updateSystemTheme = (function() {
+const updateSystemTheme = (function() {
     if (!window.matchMedia) {
         // fallback to the CSS computed value
-        return function() {
-            var cssTheme = getComputedStyle(document.documentElement)
-                .getPropertyValue('content');
+        return () => {
+            const cssTheme = getComputedStyle(document.documentElement)
+                .getPropertyValue("content");
 
             switchTheme(
                 window.currentTheme,
@@ -184,16 +190,16 @@ var updateSystemTheme = (function() {
     }
 
     // only listen to (prefers-color-scheme: dark) because light is the default
-    var mql = window.matchMedia("(prefers-color-scheme: dark)");
+    const mql = window.matchMedia("(prefers-color-scheme: dark)");
 
     function handlePreferenceChange(mql) {
-        let use = function(theme) {
+        const use = theme => {
             switchTheme(window.currentTheme, window.mainTheme, theme, true);
         };
         // maybe the user has disabled the setting in the meantime!
         if (getSettingValue("use-system-theme") !== "false") {
-            var lightTheme = getSettingValue("preferred-light-theme") || "light";
-            var darkTheme = getSettingValue("preferred-dark-theme") || "dark";
+            const lightTheme = getSettingValue("preferred-light-theme") || "light";
+            const darkTheme = getSettingValue("preferred-dark-theme") || "dark";
 
             if (mql.matches) {
                 use(darkTheme);
@@ -211,7 +217,7 @@ var updateSystemTheme = (function() {
 
     mql.addListener(handlePreferenceChange);
 
-    return function() {
+    return () => {
         handlePreferenceChange(mql);
     };
 })();
@@ -231,13 +237,19 @@ if (getSettingValue("use-system-theme") !== "false" && window.matchMedia) {
     if (getSettingValue("use-system-theme") === null
         && getSettingValue("preferred-dark-theme") === null
         && darkThemes.indexOf(localStoredTheme) >= 0) {
-        updateLocalStorage("rustdoc-preferred-dark-theme", localStoredTheme);
+        updateLocalStorage("preferred-dark-theme", localStoredTheme);
     }
 
     // call the function to initialize the theme at least once!
     updateSystemTheme();
 } else {
     switchToSavedTheme();
+}
+
+if (getSettingValue("source-sidebar-show") === "true") {
+    // At this point in page load, `document.body` is not available yet.
+    // Set a class on the `<html>` element instead.
+    addClass(document.documentElement, "source-sidebar-expanded");
 }
 
 // If we navigate away (for example to a settings page), and then use the back or
@@ -249,7 +261,7 @@ if (getSettingValue("use-system-theme") !== "false" && window.matchMedia) {
 // For some reason, if we try to change the theme while the `pageshow` event is
 // running, it sometimes fails to take effect. The problem manifests on Chrome,
 // specifically when talking to a remote website with no caching.
-window.addEventListener("pageshow", function(ev) {
+window.addEventListener("pageshow", ev => {
     if (ev.persisted) {
         setTimeout(switchToSavedTheme, 0);
     }

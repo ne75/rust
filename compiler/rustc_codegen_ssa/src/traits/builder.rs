@@ -53,8 +53,7 @@ pub trait BuilderMethods<'a, 'tcx>:
 
     fn append_sibling_block(&mut self, name: &str) -> Self::BasicBlock;
 
-    // FIXME(eddyb) replace with callers using `append_sibling_block`.
-    fn build_sibling_block(&mut self, name: &str) -> Self;
+    fn switch_to_block(&mut self, llbb: Self::BasicBlock);
 
     fn ret_void(&mut self);
     fn ret(&mut self, v: Self::Value);
@@ -222,7 +221,7 @@ pub trait BuilderMethods<'a, 'tcx>:
         assert!(matches!(self.cx().type_kind(float_ty), TypeKind::Float | TypeKind::Double));
         assert_eq!(self.cx().type_kind(int_ty), TypeKind::Integer);
 
-        if let Some(false) = self.cx().sess().opts.debugging_opts.saturating_float_casts {
+        if let Some(false) = self.cx().sess().opts.unstable_opts.saturating_float_casts {
             return if signed { self.fptosi(x, dest_ty) } else { self.fptoui(x, dest_ty) };
         }
 
@@ -480,5 +479,5 @@ pub trait BuilderMethods<'a, 'tcx>:
     ) -> Self::Value;
     fn zext(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value;
 
-    fn apply_attrs_to_cleanup_callsite(&mut self, llret: Self::Value);
+    fn do_not_inline(&mut self, llret: Self::Value);
 }

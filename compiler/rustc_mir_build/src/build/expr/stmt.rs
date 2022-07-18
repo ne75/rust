@@ -10,7 +10,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     /// (e.g., `some().code(&here());`) then `opt_stmt_span` is the
     /// span of that statement (including its semicolon, if any).
     /// The scope is used if a statement temporary must be dropped.
-    crate fn stmt_expr(
+    pub(crate) fn stmt_expr(
         &mut self,
         mut block: BasicBlock,
         expr: &Expr<'tcx>,
@@ -116,22 +116,20 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 // it is usually better to focus on `the_value` rather
                 // than the entirety of block(s) surrounding it.
                 let adjusted_span = (|| {
-                    if let ExprKind::Block { body } = &expr.kind {
-                        if let Some(tail_expr) = body.expr {
-                            let mut expr = &this.thir[tail_expr];
-                            while let ExprKind::Block {
-                                body: Block { expr: Some(nested_expr), .. },
-                            }
-                            | ExprKind::Scope { value: nested_expr, .. } = expr.kind
-                            {
-                                expr = &this.thir[nested_expr];
-                            }
-                            this.block_context.push(BlockFrame::TailExpr {
-                                tail_result_is_ignored: true,
-                                span: expr.span,
-                            });
-                            return Some(expr.span);
+                    if let ExprKind::Block { body } = &expr.kind && let Some(tail_ex) = body.expr {
+                        let mut expr = &this.thir[tail_ex];
+                        while let ExprKind::Block {
+                            body: Block { expr: Some(nested_expr), .. },
                         }
+                        | ExprKind::Scope { value: nested_expr, .. } = expr.kind
+                        {
+                            expr = &this.thir[nested_expr];
+                        }
+                        this.block_context.push(BlockFrame::TailExpr {
+                            tail_result_is_ignored: true,
+                            span: expr.span,
+                        });
+                        return Some(expr.span);
                     }
                     None
                 })();

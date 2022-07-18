@@ -1,14 +1,18 @@
-use crate::path_to_local_id;
+use crate::ty::needs_ordered_drop;
+use crate::{get_enclosing_block, path_to_local_id};
+use core::ops::ControlFlow;
 use rustc_hir as hir;
-use rustc_hir::def::{DefKind, Res};
+use rustc_hir::def::{CtorKind, DefKind, Res};
 use rustc_hir::intravisit::{self, walk_block, walk_expr, Visitor};
 use rustc_hir::{
-    Arm, Block, BlockCheckMode, Body, BodyId, Expr, ExprKind, HirId, ItemId, ItemKind, Stmt, UnOp, Unsafety,
+    Arm, Block, BlockCheckMode, Body, BodyId, Expr, ExprKind, HirId, ItemId, ItemKind, Let, QPath, Stmt, UnOp,
+    UnsafeSource, Unsafety,
 };
 use rustc_lint::LateContext;
 use rustc_middle::hir::map::Map;
 use rustc_middle::hir::nested_filter;
-use rustc_middle::ty;
+use rustc_middle::ty::adjustment::Adjust;
+use rustc_middle::ty::{self, Ty, TypeckResults};
 
 /// Convenience method for creating a `Visitor` with just `visit_expr` overridden and nested
 /// bodies (i.e. closures) are visited.
@@ -369,4 +373,247 @@ pub fn is_expr_unsafe<'tcx>(cx: &LateContext<'tcx>, e: &'tcx Expr<'_>) -> bool {
     let mut v = V { cx, is_unsafe: false };
     v.visit_expr(e);
     v.is_unsafe
+}
+
+/// Checks if the given expression contains an unsafe block
+pub fn contains_unsafe_block<'tcx>(cx: &LateContext<'tcx>, e: &'tcx Expr<'tcx>) -> bool {
+    struct V<'cx, 'tcx> {
+        cx: &'cx LateContext<'tcx>,
+        found_unsafe: bool,
+    }
+    impl<'tcx> Visitor<'tcx> for V<'_, 'tcx> {
+        type NestedFilter = nested_filter::OnlyBodies;
+        fn nested_visit_map(&mut self) -> Self::Map {
+            self.cx.tcx.hir()
+        }
+
+        fn visit_block(&mut self, b: &'tcx Block<'_>) {
+            if self.found_unsafe {
+                return;
+            }
+            if b.rules == BlockCheckMode::UnsafeBlock(UnsafeSource::UserProvided) {
+                self.found_unsafe = true;
+                return;
+            }
+            walk_block(self, b);
+        }
+    }
+    let mut v = V {
+        cx,
+        found_unsafe: false,
+    };
+    v.visit_expr(e);
+    v.found_unsafe
+}
+
+/// Runs the given function for each sub-expression producing the final value consumed by the parent
+/// of the give expression.
+///
+/// e.g. for the following expression
+/// ```rust,ignore
+/// if foo {
+///     f(0)
+/// } else {
+///     1 + 1
+/// }
+/// ```
+/// this will pass both `f(0)` and `1+1` to the given function.
+pub fn for_each_value_source<'tcx, B>(
+    e: &'tcx Expr<'tcx>,
+    f: &mut impl FnMut(&'tcx Expr<'tcx>) -> ControlFlow<B>,
+) -> ControlFlow<B> {
+    match e.kind {
+        ExprKind::Block(Block { expr: Some(e), .. }, _) => for_each_value_source(e, f),
+        ExprKind::Match(_, arms, _) => {
+            for arm in arms {
+                for_each_value_source(arm.body, f)?;
+            }
+            ControlFlow::Continue(())
+        },
+        ExprKind::If(_, if_expr, Some(else_expr)) => {
+            for_each_value_source(if_expr, f)?;
+            for_each_value_source(else_expr, f)
+        },
+        ExprKind::DropTemps(e) => for_each_value_source(e, f),
+        _ => f(e),
+    }
+}
+
+/// Runs the given function for each path expression referencing the given local which occur after
+/// the given expression.
+pub fn for_each_local_use_after_expr<'tcx, B>(
+    cx: &LateContext<'tcx>,
+    local_id: HirId,
+    expr_id: HirId,
+    f: impl FnMut(&'tcx Expr<'tcx>) -> ControlFlow<B>,
+) -> ControlFlow<B> {
+    struct V<'cx, 'tcx, F, B> {
+        cx: &'cx LateContext<'tcx>,
+        local_id: HirId,
+        expr_id: HirId,
+        found: bool,
+        res: ControlFlow<B>,
+        f: F,
+    }
+    impl<'cx, 'tcx, F: FnMut(&'tcx Expr<'tcx>) -> ControlFlow<B>, B> Visitor<'tcx> for V<'cx, 'tcx, F, B> {
+        type NestedFilter = nested_filter::OnlyBodies;
+        fn nested_visit_map(&mut self) -> Self::Map {
+            self.cx.tcx.hir()
+        }
+
+        fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
+            if !self.found {
+                if e.hir_id == self.expr_id {
+                    self.found = true;
+                } else {
+                    walk_expr(self, e);
+                }
+                return;
+            }
+            if self.res.is_break() {
+                return;
+            }
+            if path_to_local_id(e, self.local_id) {
+                self.res = (self.f)(e);
+            } else {
+                walk_expr(self, e);
+            }
+        }
+    }
+
+    if let Some(b) = get_enclosing_block(cx, local_id) {
+        let mut v = V {
+            cx,
+            local_id,
+            expr_id,
+            found: false,
+            res: ControlFlow::Continue(()),
+            f,
+        };
+        v.visit_block(b);
+        v.res
+    } else {
+        ControlFlow::Continue(())
+    }
+}
+
+// Calls the given function for every unconsumed temporary created by the expression. Note the
+// function is only guaranteed to be called for types which need to be dropped, but it may be called
+// for other types.
+pub fn for_each_unconsumed_temporary<'tcx, B>(
+    cx: &LateContext<'tcx>,
+    e: &'tcx Expr<'tcx>,
+    mut f: impl FnMut(Ty<'tcx>) -> ControlFlow<B>,
+) -> ControlFlow<B> {
+    // Todo: Handle partially consumed values.
+    fn helper<'tcx, B>(
+        typeck: &'tcx TypeckResults<'tcx>,
+        consume: bool,
+        e: &'tcx Expr<'tcx>,
+        f: &mut impl FnMut(Ty<'tcx>) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if !consume
+            || matches!(
+                typeck.expr_adjustments(e),
+                [adjust, ..] if matches!(adjust.kind, Adjust::Borrow(_) | Adjust::Deref(_))
+            )
+        {
+            match e.kind {
+                ExprKind::Path(QPath::Resolved(None, p))
+                    if matches!(p.res, Res::Def(DefKind::Ctor(_, CtorKind::Const), _)) =>
+                {
+                    f(typeck.expr_ty(e))?;
+                },
+                ExprKind::Path(_)
+                | ExprKind::Unary(UnOp::Deref, _)
+                | ExprKind::Index(..)
+                | ExprKind::Field(..)
+                | ExprKind::AddrOf(..) => (),
+                _ => f(typeck.expr_ty(e))?,
+            }
+        }
+        match e.kind {
+            ExprKind::AddrOf(_, _, e)
+            | ExprKind::Field(e, _)
+            | ExprKind::Unary(UnOp::Deref, e)
+            | ExprKind::Match(e, ..)
+            | ExprKind::Let(&Let { init: e, .. }) => {
+                helper(typeck, false, e, f)?;
+            },
+            ExprKind::Block(&Block { expr: Some(e), .. }, _)
+            | ExprKind::Box(e)
+            | ExprKind::Cast(e, _)
+            | ExprKind::Unary(_, e) => {
+                helper(typeck, true, e, f)?;
+            },
+            ExprKind::Call(callee, args) => {
+                helper(typeck, true, callee, f)?;
+                for arg in args {
+                    helper(typeck, true, arg, f)?;
+                }
+            },
+            ExprKind::MethodCall(_, args, _) | ExprKind::Tup(args) | ExprKind::Array(args) => {
+                for arg in args {
+                    helper(typeck, true, arg, f)?;
+                }
+            },
+            ExprKind::Index(borrowed, consumed)
+            | ExprKind::Assign(borrowed, consumed, _)
+            | ExprKind::AssignOp(_, borrowed, consumed) => {
+                helper(typeck, false, borrowed, f)?;
+                helper(typeck, true, consumed, f)?;
+            },
+            ExprKind::Binary(_, lhs, rhs) => {
+                helper(typeck, true, lhs, f)?;
+                helper(typeck, true, rhs, f)?;
+            },
+            ExprKind::Struct(_, fields, default) => {
+                for field in fields {
+                    helper(typeck, true, field.expr, f)?;
+                }
+                if let Some(default) = default {
+                    helper(typeck, false, default, f)?;
+                }
+            },
+            ExprKind::If(cond, then, else_expr) => {
+                helper(typeck, true, cond, f)?;
+                helper(typeck, true, then, f)?;
+                if let Some(else_expr) = else_expr {
+                    helper(typeck, true, else_expr, f)?;
+                }
+            },
+            ExprKind::Type(e, _) => {
+                helper(typeck, consume, e, f)?;
+            },
+
+            // Either drops temporaries, jumps out of the current expression, or has no sub expression.
+            ExprKind::DropTemps(_)
+            | ExprKind::Ret(_)
+            | ExprKind::Break(..)
+            | ExprKind::Yield(..)
+            | ExprKind::Block(..)
+            | ExprKind::Loop(..)
+            | ExprKind::Repeat(..)
+            | ExprKind::Lit(_)
+            | ExprKind::ConstBlock(_)
+            | ExprKind::Closure { .. }
+            | ExprKind::Path(_)
+            | ExprKind::Continue(_)
+            | ExprKind::InlineAsm(_)
+            | ExprKind::Err => (),
+        }
+        ControlFlow::Continue(())
+    }
+    helper(cx.typeck_results(), true, e, &mut f)
+}
+
+pub fn any_temporaries_need_ordered_drop<'tcx>(cx: &LateContext<'tcx>, e: &'tcx Expr<'tcx>) -> bool {
+    for_each_unconsumed_temporary(cx, e, |ty| {
+        if needs_ordered_drop(cx, ty) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })
+    .is_break()
 }

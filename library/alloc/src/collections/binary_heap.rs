@@ -151,9 +151,12 @@ use core::ptr;
 
 use crate::collections::TryReserveError;
 use crate::slice;
-use crate::vec::{self, AsIntoIter, Vec};
+use crate::vec::{self, AsVecIntoIter, Vec};
 
 use super::SpecExtend;
+
+#[cfg(test)]
+mod tests;
 
 /// A priority queue implemented with a binary heap.
 ///
@@ -163,9 +166,10 @@ use super::SpecExtend;
 /// item's ordering relative to any other item, as determined by the [`Ord`]
 /// trait, changes while it is in the heap. This is normally only possible
 /// through [`Cell`], [`RefCell`], global state, I/O, or unsafe code. The
-/// behavior resulting from such a logic error is not specified (it
-/// could include panics, incorrect results, aborts, memory leaks, or
-/// non-termination) but will not be undefined behavior.
+/// behavior resulting from such a logic error is not specified, but will
+/// be encapsulated to the `BinaryHeap` that observed the logic error and not
+/// result in undefined behavior. This could include panics, incorrect results,
+/// aborts, memory leaks, and non-termination.
 ///
 /// # Examples
 ///
@@ -194,7 +198,7 @@ use super::SpecExtend;
 /// // We can iterate over the items in the heap, although they are returned in
 /// // a random order.
 /// for x in &heap {
-///     println!("{}", x);
+///     println!("{x}");
 /// }
 ///
 /// // If we instead pop these scores, they should come back in order.
@@ -370,10 +374,11 @@ impl<T: Ord> BinaryHeap<T> {
         BinaryHeap { data: vec![] }
     }
 
-    /// Creates an empty `BinaryHeap` with a specific capacity.
-    /// This preallocates enough memory for `capacity` elements,
-    /// so that the `BinaryHeap` does not have to be reallocated
-    /// until it contains at least that many values.
+    /// Creates an empty `BinaryHeap` with at least the specified capacity.
+    ///
+    /// The binary heap will be able to hold at least `capacity` elements without
+    /// reallocating. This method is allowed to allocate for more elements than
+    /// `capacity`. If `capacity` is 0, the binary heap will not allocate.
     ///
     /// # Examples
     ///
@@ -746,9 +751,12 @@ impl<T: Ord> BinaryHeap<T> {
         self.rebuild_tail(start);
     }
 
-    /// Returns an iterator which retrieves elements in heap order.
-    /// The retrieved elements are removed from the original heap.
-    /// The remaining elements will be removed on drop in heap order.
+    /// Clears the binary heap, returning an iterator over the removed elements
+    /// in heap order. If the iterator is dropped before being fully consumed,
+    /// it drops the remaining elements in heap order.
+    ///
+    /// The returned iterator keeps a mutable borrow on the heap to optimize
+    /// its implementation.
     ///
     /// Note:
     /// * `.drain_sorted()` is *O*(*n* \* log(*n*)); much slower than `.drain()`.
@@ -776,7 +784,7 @@ impl<T: Ord> BinaryHeap<T> {
 
     /// Retains only the elements specified by the predicate.
     ///
-    /// In other words, remove all elements `e` such that `f(&e)` returns
+    /// In other words, remove all elements `e` for which `f(&e)` returns
     /// `false`. The elements are visited in unsorted (and unspecified) order.
     ///
     /// # Examples
@@ -827,7 +835,7 @@ impl<T> BinaryHeap<T> {
     ///
     /// // Print 1, 2, 3, 4 in arbitrary order
     /// for x in heap.iter() {
-    ///     println!("{}", x);
+    ///     println!("{x}");
     /// }
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
@@ -899,16 +907,18 @@ impl<T> BinaryHeap<T> {
         self.data.capacity()
     }
 
-    /// Reserves the minimum capacity for exactly `additional` more elements to be inserted in the
-    /// given `BinaryHeap`. Does nothing if the capacity is already sufficient.
+    /// Reserves the minimum capacity for at least `additional` elements more than
+    /// the current length. Unlike [`reserve`], this will not
+    /// deliberately over-allocate to speculatively avoid frequent allocations.
+    /// After calling `reserve_exact`, capacity will be greater than or equal to
+    /// `self.len() + additional`. Does nothing if the capacity is already
+    /// sufficient.
     ///
-    /// Note that the allocator may give the collection more space than it requests. Therefore
-    /// capacity can not be relied upon to be precisely minimal. Prefer [`reserve`] if future
-    /// insertions are expected.
+    /// [`reserve`]: BinaryHeap::reserve
     ///
     /// # Panics
     ///
-    /// Panics if the new capacity overflows `usize`.
+    /// Panics if the new capacity overflows [`usize`].
     ///
     /// # Examples
     ///
@@ -928,12 +938,15 @@ impl<T> BinaryHeap<T> {
         self.data.reserve_exact(additional);
     }
 
-    /// Reserves capacity for at least `additional` more elements to be inserted in the
-    /// `BinaryHeap`. The collection may reserve more space to avoid frequent reallocations.
+    /// Reserves capacity for at least `additional` elements more than the
+    /// current length. The allocator may reserve more space to speculatively
+    /// avoid frequent allocations. After calling `reserve`,
+    /// capacity will be greater than or equal to `self.len() + additional`.
+    /// Does nothing if capacity is already sufficient.
     ///
     /// # Panics
     ///
-    /// Panics if the new capacity overflows `usize`.
+    /// Panics if the new capacity overflows [`usize`].
     ///
     /// # Examples
     ///
@@ -951,10 +964,11 @@ impl<T> BinaryHeap<T> {
         self.data.reserve(additional);
     }
 
-    /// Tries to reserve the minimum capacity for exactly `additional`
-    /// elements to be inserted in the given `BinaryHeap<T>`. After calling
-    /// `try_reserve_exact`, capacity will be greater than or equal to
-    /// `self.len() + additional` if it returns `Ok(())`.
+    /// Tries to reserve the minimum capacity for at least `additional` elements
+    /// more than the current length. Unlike [`try_reserve`], this will not
+    /// deliberately over-allocate to speculatively avoid frequent allocations.
+    /// After calling `try_reserve_exact`, capacity will be greater than or
+    /// equal to `self.len() + additional` if it returns `Ok(())`.
     /// Does nothing if the capacity is already sufficient.
     ///
     /// Note that the allocator may give the collection more space than it
@@ -971,7 +985,6 @@ impl<T> BinaryHeap<T> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(try_reserve_2)]
     /// use std::collections::BinaryHeap;
     /// use std::collections::TryReserveError;
     ///
@@ -988,16 +1001,16 @@ impl<T> BinaryHeap<T> {
     /// }
     /// # find_max_slow(&[1, 2, 3]).expect("why is the test harness OOMing on 12 bytes?");
     /// ```
-    #[unstable(feature = "try_reserve_2", issue = "91789")]
+    #[stable(feature = "try_reserve_2", since = "1.63.0")]
     pub fn try_reserve_exact(&mut self, additional: usize) -> Result<(), TryReserveError> {
         self.data.try_reserve_exact(additional)
     }
 
-    /// Tries to reserve capacity for at least `additional` more elements to be inserted
-    /// in the given `BinaryHeap<T>`. The collection may reserve more space to avoid
-    /// frequent reallocations. After calling `try_reserve`, capacity will be
-    /// greater than or equal to `self.len() + additional`. Does nothing if
-    /// capacity is already sufficient.
+    /// Tries to reserve capacity for at least `additional` elements more than the
+    /// current length. The allocator may reserve more space to speculatively
+    /// avoid frequent allocations. After calling `try_reserve`, capacity will be
+    /// greater than or equal to `self.len() + additional` if it returns
+    /// `Ok(())`. Does nothing if capacity is already sufficient.
     ///
     /// # Errors
     ///
@@ -1007,7 +1020,6 @@ impl<T> BinaryHeap<T> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(try_reserve_2)]
     /// use std::collections::BinaryHeap;
     /// use std::collections::TryReserveError;
     ///
@@ -1024,7 +1036,7 @@ impl<T> BinaryHeap<T> {
     /// }
     /// # find_max_slow(&[1, 2, 3]).expect("why is the test harness OOMing on 12 bytes?");
     /// ```
-    #[unstable(feature = "try_reserve_2", issue = "91789")]
+    #[stable(feature = "try_reserve_2", since = "1.63.0")]
     pub fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError> {
         self.data.try_reserve(additional)
     }
@@ -1107,7 +1119,7 @@ impl<T> BinaryHeap<T> {
     ///
     /// // Will print in some order
     /// for x in vec {
-    ///     println!("{}", x);
+    ///     println!("{x}");
     /// }
     /// ```
     #[must_use = "`self` will be dropped if the result is not used"]
@@ -1158,9 +1170,12 @@ impl<T> BinaryHeap<T> {
         self.len() == 0
     }
 
-    /// Clears the binary heap, returning an iterator over the removed elements.
+    /// Clears the binary heap, returning an iterator over the removed elements
+    /// in arbitrary order. If the iterator is dropped before being fully
+    /// consumed, it drops the remaining elements in arbitrary order.
     ///
-    /// The elements are removed in arbitrary order.
+    /// The returned iterator keeps a mutable borrow on the heap to optimize
+    /// its implementation.
     ///
     /// # Examples
     ///
@@ -1173,7 +1188,7 @@ impl<T> BinaryHeap<T> {
     /// assert!(!heap.is_empty());
     ///
     /// for x in heap.drain() {
-    ///     println!("{}", x);
+    ///     println!("{x}");
     /// }
     ///
     /// assert!(heap.is_empty());
@@ -1395,6 +1410,8 @@ impl<T> ExactSizeIterator for IntoIter<T> {
 #[stable(feature = "fused", since = "1.26.0")]
 impl<T> FusedIterator for IntoIter<T> {}
 
+// In addition to the SAFETY invariants of the following three unsafe traits
+// also refer to the vec::in_place_collect module documentation to get an overview
 #[unstable(issue = "none", feature = "inplace_iteration")]
 #[doc(hidden)]
 unsafe impl<T> SourceIter for IntoIter<T> {
@@ -1410,7 +1427,7 @@ unsafe impl<T> SourceIter for IntoIter<T> {
 #[doc(hidden)]
 unsafe impl<I> InPlaceIterable for IntoIter<I> {}
 
-impl<I> AsIntoIter for IntoIter<I> {
+unsafe impl<I> AsVecIntoIter for IntoIter<I> {
     type Item = I;
 
     fn as_into_iter(&mut self) -> &mut vec::IntoIter<Self::Item> {
@@ -1618,7 +1635,7 @@ impl<T> IntoIterator for BinaryHeap<T> {
     /// // Print 1, 2, 3, 4 in arbitrary order
     /// for x in heap.into_iter() {
     ///     // x has type i32, not &i32
-    ///     println!("{}", x);
+    ///     println!("{x}");
     /// }
     /// ```
     fn into_iter(self) -> IntoIter<T> {

@@ -1,3 +1,4 @@
+#![feature(lint_reasons)]
 #![allow(unused, clippy::many_single_char_names, clippy::redundant_clone)]
 #![warn(clippy::ptr_arg)]
 
@@ -109,16 +110,20 @@ mod issue_5644 {
         #[allow(clippy::ptr_arg)] _s: &String,
         #[allow(clippy::ptr_arg)] _p: &PathBuf,
         #[allow(clippy::ptr_arg)] _c: &Cow<[i32]>,
+        #[expect(clippy::ptr_arg)] _expect: &Cow<[i32]>,
     ) {
     }
 
-    struct S {}
+    fn some_allowed(#[allow(clippy::ptr_arg)] _v: &Vec<u32>, _s: &String) {}
+
+    struct S;
     impl S {
         fn allowed(
             #[allow(clippy::ptr_arg)] _v: &Vec<u32>,
             #[allow(clippy::ptr_arg)] _s: &String,
             #[allow(clippy::ptr_arg)] _p: &PathBuf,
             #[allow(clippy::ptr_arg)] _c: &Cow<[i32]>,
+            #[expect(clippy::ptr_arg)] _expect: &Cow<[i32]>,
         ) {
         }
     }
@@ -129,6 +134,7 @@ mod issue_5644 {
             #[allow(clippy::ptr_arg)] _s: &String,
             #[allow(clippy::ptr_arg)] _p: &PathBuf,
             #[allow(clippy::ptr_arg)] _c: &Cow<[i32]>,
+            #[expect(clippy::ptr_arg)] _expect: &Cow<[i32]>,
         ) {
         }
     }
@@ -180,3 +186,24 @@ fn dyn_fn_requires_vec(v: &Vec<u32>, f: &dyn Fn(&Vec<u32>)) {
 // No error for types behind an alias (#7699)
 type A = Vec<u8>;
 fn aliased(a: &A) {}
+
+// Issue #8366
+pub trait Trait {
+    fn f(v: &mut Vec<i32>);
+    fn f2(v: &mut Vec<i32>) {}
+}
+
+// Issue #8463
+fn two_vecs(a: &mut Vec<u32>, b: &mut Vec<u32>) {
+    a.push(0);
+    a.push(0);
+    a.push(0);
+    b.push(1);
+}
+
+// Issue #8495
+fn cow_conditional_to_mut(a: &mut Cow<str>) {
+    if a.is_empty() {
+        a.to_mut().push_str("foo");
+    }
+}

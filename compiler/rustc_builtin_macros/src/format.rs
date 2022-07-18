@@ -4,15 +4,19 @@ use Position::*;
 use rustc_ast as ast;
 use rustc_ast::ptr::P;
 use rustc_ast::tokenstream::TokenStream;
+use rustc_ast::visit::{self, Visitor};
 use rustc_ast::{token, BlockCheckMode, UnsafeSource};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
-use rustc_errors::{pluralize, Applicability, DiagnosticBuilder};
+use rustc_errors::{pluralize, Applicability, MultiSpan, PResult};
 use rustc_expand::base::{self, *};
 use rustc_parse_format as parse;
 use rustc_span::symbol::{sym, Ident, Symbol};
-use rustc_span::{MultiSpan, Span};
+use rustc_span::{InnerSpan, Span};
 use smallvec::SmallVec;
 
+use rustc_lint_defs::builtin::NAMED_ARGUMENTS_USED_POSITIONALLY;
+use rustc_lint_defs::{BufferedEarlyLint, BuiltinLintDiagnostics, LintId};
+use rustc_parse_format::Count;
 use std::borrow::Cow;
 use std::collections::hash_map::Entry;
 
@@ -24,7 +28,8 @@ enum ArgumentType {
 
 enum Position {
     Exact(usize),
-    Named(Symbol),
+    Capture(usize),
+    Named(Symbol, InnerSpan),
 }
 
 struct Context<'a, 'b> {
@@ -48,12 +53,14 @@ struct Context<'a, 'b> {
     /// * `arg_unique_types` (in simplified JSON): `[["o", "x"], ["o", "x"], ["o", "x"]]`
     /// * `names` (in JSON): `{"foo": 2}`
     args: Vec<P<ast::Expr>>,
+    /// The number of arguments that were added by implicit capturing.
+    num_captured_args: usize,
     /// Placeholder slot numbers indexed by argument.
     arg_types: Vec<Vec<usize>>,
     /// Unique format specs seen for each argument.
     arg_unique_types: Vec<Vec<ArgumentType>>,
     /// Map from named arguments to their resolved indices.
-    names: FxHashMap<Symbol, usize>,
+    names: FxHashMap<Symbol, (usize, Span)>,
 
     /// The latest consecutive literal strings, or empty if there weren't any.
     literal: String,
@@ -126,9 +133,9 @@ fn parse_args<'a>(
     ecx: &mut ExtCtxt<'a>,
     sp: Span,
     tts: TokenStream,
-) -> Result<(P<ast::Expr>, Vec<P<ast::Expr>>, FxHashMap<Symbol, usize>), DiagnosticBuilder<'a>> {
+) -> PResult<'a, (P<ast::Expr>, Vec<P<ast::Expr>>, FxHashMap<Symbol, (usize, Span)>)> {
     let mut args = Vec::<P<ast::Expr>>::new();
-    let mut names = FxHashMap::<Symbol, usize>::default();
+    let mut names = FxHashMap::<Symbol, (usize, Span)>::default();
 
     let mut p = ecx.new_parser_from_tts(tts);
 
@@ -193,7 +200,7 @@ fn parse_args<'a>(
                 p.bump();
                 p.expect(&token::Eq)?;
                 let e = p.parse_expr()?;
-                if let Some(prev) = names.get(&ident.name) {
+                if let Some((prev, _)) = names.get(&ident.name) {
                     ecx.struct_span_err(e.span, &format!("duplicate argument named `{}`", ident))
                         .span_label(args[*prev].span, "previously here")
                         .span_label(e.span, "duplicate argument")
@@ -206,7 +213,7 @@ fn parse_args<'a>(
                 // if the input is valid, we can simply append to the positional
                 // args. And remember the names.
                 let slot = args.len();
-                names.insert(ident.name, slot);
+                names.insert(ident.name, (slot, ident.span));
                 args.push(e);
             }
             _ => {
@@ -218,7 +225,7 @@ fn parse_args<'a>(
                     );
                     err.span_label(e.span, "positional arguments must be before named arguments");
                     for pos in names.values() {
-                        err.span_label(args[*pos].span, "named argument");
+                        err.span_label(args[pos.0].span, "named argument");
                     }
                     err.emit();
                 }
@@ -230,21 +237,27 @@ fn parse_args<'a>(
 }
 
 impl<'a, 'b> Context<'a, 'b> {
+    /// The number of arguments that were explicitly given.
+    fn num_args(&self) -> usize {
+        self.args.len() - self.num_captured_args
+    }
+
     fn resolve_name_inplace(&self, p: &mut parse::Piece<'_>) {
         // NOTE: the `unwrap_or` branch is needed in case of invalid format
         // arguments, e.g., `format_args!("{foo}")`.
-        let lookup = |s: Symbol| *self.names.get(&s).unwrap_or(&0);
+        let lookup =
+            |s: &str| self.names.get(&Symbol::intern(s)).unwrap_or(&(0, Span::default())).0;
 
         match *p {
             parse::String(_) => {}
             parse::NextArgument(ref mut arg) => {
-                if let parse::ArgumentNamed(s) = arg.position {
+                if let parse::ArgumentNamed(s, _) = arg.position {
                     arg.position = parse::ArgumentIs(lookup(s));
                 }
-                if let parse::CountIsName(s) = arg.format.width {
+                if let parse::CountIsName(s, _) = arg.format.width {
                     arg.format.width = parse::CountIsParam(lookup(s));
                 }
-                if let parse::CountIsName(s) = arg.format.precision {
+                if let parse::CountIsName(s, _) = arg.format.precision {
                     arg.format.precision = parse::CountIsParam(lookup(s));
                 }
             }
@@ -267,7 +280,9 @@ impl<'a, 'b> Context<'a, 'b> {
                 // it's written second, so it should come after width/precision.
                 let pos = match arg.position {
                     parse::ArgumentIs(i) | parse::ArgumentImplicitlyIs(i) => Exact(i),
-                    parse::ArgumentNamed(s) => Named(s),
+                    parse::ArgumentNamed(s, span) => {
+                        Named(Symbol::intern(s), InnerSpan::new(span.start, span.end))
+                    }
                 };
 
                 let ty = Placeholder(match arg.format.ty {
@@ -282,7 +297,10 @@ impl<'a, 'b> Context<'a, 'b> {
                     "X" => "UpperHex",
                     _ => {
                         let fmtsp = self.fmtsp;
-                        let sp = arg.format.ty_span.map(|sp| fmtsp.from_inner(sp));
+                        let sp = arg
+                            .format
+                            .ty_span
+                            .map(|sp| fmtsp.from_inner(InnerSpan::new(sp.start, sp.end)));
                         let mut err = self.ecx.struct_span_err(
                             sp.unwrap_or(fmtsp),
                             &format!("unknown format trait `{}`", arg.format.ty),
@@ -316,7 +334,7 @@ impl<'a, 'b> Context<'a, 'b> {
                                 err.tool_only_span_suggestion(
                                     sp,
                                     &format!("use the `{}` trait", name),
-                                    (*fmt).to_string(),
+                                    *fmt,
                                     Applicability::MaybeIncorrect,
                                 );
                             }
@@ -331,20 +349,23 @@ impl<'a, 'b> Context<'a, 'b> {
         }
     }
 
-    fn verify_count(&mut self, c: parse::Count) {
+    fn verify_count(&mut self, c: parse::Count<'_>) {
         match c {
             parse::CountImplied | parse::CountIs(..) => {}
             parse::CountIsParam(i) => {
                 self.verify_arg_type(Exact(i), Count);
             }
-            parse::CountIsName(s) => {
-                self.verify_arg_type(Named(s), Count);
+            parse::CountIsName(s, span) => {
+                self.verify_arg_type(
+                    Named(Symbol::intern(s), InnerSpan::new(span.start, span.end)),
+                    Count,
+                );
             }
         }
     }
 
     fn describe_num_args(&self) -> Cow<'_, str> {
-        match self.args.len() {
+        match self.num_args() {
             0 => "no arguments were given".into(),
             1 => "there is 1 argument".into(),
             x => format!("there are {} arguments", x).into(),
@@ -370,7 +391,7 @@ impl<'a, 'b> Context<'a, 'b> {
 
         let count = self.pieces.len()
             + self.arg_with_formatting.iter().filter(|fmt| fmt.precision_span.is_some()).count();
-        if self.names.is_empty() && !numbered_position_args && count != self.args.len() {
+        if self.names.is_empty() && !numbered_position_args && count != self.num_args() {
             e = self.ecx.struct_span_err(
                 sp,
                 &format!(
@@ -416,9 +437,9 @@ impl<'a, 'b> Context<'a, 'b> {
 
         for fmt in &self.arg_with_formatting {
             if let Some(span) = fmt.precision_span {
-                let span = self.fmtsp.from_inner(span);
+                let span = self.fmtsp.from_inner(InnerSpan::new(span.start, span.end));
                 match fmt.precision {
-                    parse::CountIsParam(pos) if pos > self.args.len() => {
+                    parse::CountIsParam(pos) if pos > self.num_args() => {
                         e.span_label(
                             span,
                             &format!(
@@ -437,7 +458,9 @@ impl<'a, 'b> Context<'a, 'b> {
                                 .iter()
                                 .filter(|fmt| fmt.precision_span.is_some())
                                 .count();
-                        e.span_label(span, &format!(
+                        e.span_label(
+                            span,
+                            &format!(
                             "this precision flag adds an extra required argument at position {}, \
                              which is why there {} expected",
                             pos,
@@ -446,7 +469,8 @@ impl<'a, 'b> Context<'a, 'b> {
                             } else {
                                 format!("are {} arguments", count)
                             },
-                        ));
+                        ),
+                        );
                         if let Some(arg) = self.args.get(pos) {
                             e.span_label(
                                 arg.span,
@@ -459,9 +483,9 @@ impl<'a, 'b> Context<'a, 'b> {
                 }
             }
             if let Some(span) = fmt.width_span {
-                let span = self.fmtsp.from_inner(span);
+                let span = self.fmtsp.from_inner(InnerSpan::new(span.start, span.end));
                 match fmt.width {
-                    parse::CountIsParam(pos) if pos > self.args.len() => {
+                    parse::CountIsParam(pos) if pos > self.num_args() => {
                         e.span_label(
                             span,
                             &format!(
@@ -493,12 +517,15 @@ impl<'a, 'b> Context<'a, 'b> {
     /// Actually verifies and tracks a given format placeholder
     /// (a.k.a. argument).
     fn verify_arg_type(&mut self, arg: Position, ty: ArgumentType) {
+        if let Exact(arg) = arg {
+            if arg >= self.num_args() {
+                self.invalid_refs.push((arg, self.curpiece));
+                return;
+            }
+        }
+
         match arg {
-            Exact(arg) => {
-                if self.args.len() <= arg {
-                    self.invalid_refs.push((arg, self.curpiece));
-                    return;
-                }
+            Exact(arg) | Capture(arg) => {
                 match ty {
                     Placeholder(_) => {
                         // record every (position, type) combination only once
@@ -521,11 +548,11 @@ impl<'a, 'b> Context<'a, 'b> {
                 }
             }
 
-            Named(name) => {
+            Named(name, span) => {
                 match self.names.get(&name) {
                     Some(&idx) => {
                         // Treat as positional arg.
-                        self.verify_arg_type(Exact(idx), ty)
+                        self.verify_arg_type(Capture(idx.0), ty)
                     }
                     None => {
                         // For the moment capturing variables from format strings expanded from macros is
@@ -536,17 +563,18 @@ impl<'a, 'b> Context<'a, 'b> {
                             self.arg_types.push(Vec::new());
                             self.arg_unique_types.push(Vec::new());
                             let span = if self.is_literal {
-                                *self.arg_spans.get(self.curpiece).unwrap_or(&self.fmtsp)
+                                self.fmtsp.from_inner(span)
                             } else {
                                 self.fmtsp
                             };
+                            self.num_captured_args += 1;
                             self.args.push(self.ecx.expr_ident(span, Ident::new(name, span)));
-                            self.names.insert(name, idx);
-                            self.verify_arg_type(Exact(idx), ty)
+                            self.names.insert(name, (idx, span));
+                            self.verify_arg_type(Capture(idx), ty)
                         } else {
                             let msg = format!("there is no argument named `{}`", name);
                             let sp = if self.is_literal {
-                                *self.arg_spans.get(self.curpiece).unwrap_or(&self.fmtsp)
+                                self.fmtsp.from_inner(span)
                             } else {
                                 self.fmtsp
                             };
@@ -594,7 +622,7 @@ impl<'a, 'b> Context<'a, 'b> {
         ecx.std_path(&[sym::fmt, sym::rt, sym::v1, s])
     }
 
-    fn build_count(&self, c: parse::Count) -> P<ast::Expr> {
+    fn build_count(&self, c: parse::Count<'_>) -> P<ast::Expr> {
         let sp = self.macsp;
         let count = |c, arg| {
             let mut path = Context::rtpath(self.ecx, sym::Count);
@@ -616,7 +644,7 @@ impl<'a, 'b> Context<'a, 'b> {
             }
             parse::CountImplied => count(sym::Implied, None),
             // should never be the case, names are already resolved
-            parse::CountIsName(_) => panic!("should never happen"),
+            parse::CountIsName(..) => panic!("should never happen"),
         }
     }
 
@@ -663,7 +691,7 @@ impl<'a, 'b> Context<'a, 'b> {
 
                         // should never be the case, because names are already
                         // resolved.
-                        parse::ArgumentNamed(_) => panic!("should never happen"),
+                        parse::ArgumentNamed(..) => panic!("should never happen"),
                     }
                 };
 
@@ -752,7 +780,7 @@ impl<'a, 'b> Context<'a, 'b> {
 
         // First, build up the static array which will become our precompiled
         // format "string"
-        let pieces = self.ecx.expr_vec_slice(self.fmtsp, self.str_pieces);
+        let pieces = self.ecx.expr_array_ref(self.fmtsp, self.str_pieces);
 
         // We need to construct a &[ArgumentV1] to pass into the fmt::Arguments
         // constructor. In general the expressions in this slice might be
@@ -788,36 +816,50 @@ impl<'a, 'b> Context<'a, 'b> {
         // the order provided to fmt::Arguments. When arguments are repeated, we
         // want the expression evaluated only once.
         //
-        // Thus in the not nicely ordered case we emit the following instead:
+        // Further, if any arg _after the first one_ contains a yield point such
+        // as `await` or `yield`, the above short form is inconvenient for the
+        // caller because it would keep a temporary of type ArgumentV1 alive
+        // across the yield point. ArgumentV1 can't implement Send since it
+        // holds a type-erased arbitrary type.
+        //
+        // Thus in the not nicely ordered case, and in the yielding case, we
+        // emit the following instead:
         //
         //     match (&$arg0, &$arg1, …) {
-        //         _args => [ArgumentV1::new(_args.$i, …), ArgumentV1::new(_args.$j, …), …]
+        //         args => [ArgumentV1::new(args.$i, …), ArgumentV1::new(args.$j, …), …]
         //     }
         //
         // for the sequence of indices $i, $j, … governed by fmt_arg_index_and_ty.
+        // This more verbose representation ensures that all arguments are
+        // evaluated a single time each, in the order written by the programmer,
+        // and that the surrounding future/generator (if any) is Send whenever
+        // possible.
+        let no_need_for_match =
+            nicely_ordered && !original_args.iter().skip(1).any(|e| may_contain_yield_point(e));
+
         for (arg_index, arg_ty) in fmt_arg_index_and_ty {
             let e = &mut original_args[arg_index];
             let span = e.span;
-            let arg = if nicely_ordered {
+            let arg = if no_need_for_match {
                 let expansion_span = e.span.with_ctxt(self.macsp.ctxt());
                 // The indices are strictly ordered so e has not been taken yet.
                 self.ecx.expr_addr_of(expansion_span, P(e.take()))
             } else {
                 let def_site = self.ecx.with_def_site_ctxt(span);
-                let args_tuple = self.ecx.expr_ident(def_site, Ident::new(sym::_args, def_site));
+                let args_tuple = self.ecx.expr_ident(def_site, Ident::new(sym::args, def_site));
                 let member = Ident::new(sym::integer(arg_index), def_site);
                 self.ecx.expr(def_site, ast::ExprKind::Field(args_tuple, member))
             };
             fmt_args.push(Context::format_arg(self.ecx, self.macsp, span, arg_ty, arg));
         }
 
-        let args_array = self.ecx.expr_vec(self.macsp, fmt_args);
+        let args_array = self.ecx.expr_array(self.macsp, fmt_args);
         let args_slice = self.ecx.expr_addr_of(
             self.macsp,
-            if nicely_ordered {
+            if no_need_for_match {
                 args_array
             } else {
-                // In the !nicely_ordered case, none of the exprs were moved
+                // In the !no_need_for_match case, none of the exprs were moved
                 // away in the previous loop.
                 //
                 // This uses the arg span for `&arg` so that borrowck errors
@@ -828,7 +870,7 @@ impl<'a, 'b> Context<'a, 'b> {
                     .map(|e| self.ecx.expr_addr_of(e.span.with_ctxt(self.macsp.ctxt()), e))
                     .collect();
 
-                let pat = self.ecx.pat_ident(self.macsp, Ident::new(sym::_args, self.macsp));
+                let pat = self.ecx.pat_ident(self.macsp, Ident::new(sym::args, self.macsp));
                 let arm = self.ecx.arm(self.macsp, pat, args_array);
                 let head = self.ecx.expr(self.macsp, ast::ExprKind::Tup(heads));
                 self.ecx.expr_match(self.macsp, head, vec![arm])
@@ -841,7 +883,7 @@ impl<'a, 'b> Context<'a, 'b> {
         } else {
             // Build up the static array which will store our precompiled
             // nonstandard placeholders, if there are any.
-            let fmt = self.ecx.expr_vec_slice(self.macsp, self.pieces);
+            let fmt = self.ecx.expr_array_ref(self.macsp, self.pieces);
 
             let path = self.ecx.std_path(&[sym::fmt, sym::UnsafeArg, sym::new]);
             let unsafe_arg = self.ecx.expr_call_global(self.macsp, path, Vec::new());
@@ -877,11 +919,21 @@ impl<'a, 'b> Context<'a, 'b> {
                 return ecx.expr_call_global(macsp, path, vec![arg]);
             }
         };
+        let new_fn_name = match trait_ {
+            "Display" => "new_display",
+            "Debug" => "new_debug",
+            "LowerExp" => "new_lower_exp",
+            "UpperExp" => "new_upper_exp",
+            "Octal" => "new_octal",
+            "Pointer" => "new_pointer",
+            "Binary" => "new_binary",
+            "LowerHex" => "new_lower_hex",
+            "UpperHex" => "new_upper_hex",
+            _ => unreachable!(),
+        };
 
-        let path = ecx.std_path(&[sym::fmt, Symbol::intern(trait_), sym::fmt]);
-        let format_fn = ecx.path_global(sp, path);
-        let path = ecx.std_path(&[sym::fmt, sym::ArgumentV1, sym::new]);
-        ecx.expr_call_global(macsp, path, vec![arg, ecx.expr_path(format_fn)])
+        let path = ecx.std_path(&[sym::fmt, sym::ArgumentV1, Symbol::intern(new_fn_name)]);
+        ecx.expr_call_global(sp, path, vec![arg])
     }
 }
 
@@ -919,6 +971,48 @@ pub fn expand_format_args_nl<'cx>(
     expand_format_args_impl(ecx, sp, tts, true)
 }
 
+fn lint_named_arguments_used_positionally(
+    names: FxHashMap<Symbol, (usize, Span)>,
+    cx: &mut Context<'_, '_>,
+    unverified_pieces: Vec<parse::Piece<'_>>,
+) {
+    let mut used_argument_names = FxHashSet::<&str>::default();
+    for piece in unverified_pieces {
+        if let rustc_parse_format::Piece::NextArgument(a) = piece {
+            match a.position {
+                rustc_parse_format::Position::ArgumentNamed(arg_name, _) => {
+                    used_argument_names.insert(arg_name);
+                }
+                _ => {}
+            };
+            if let Count::CountIsName(s, _) = a.format.width {
+                used_argument_names.insert(s);
+            }
+            if let Count::CountIsName(s, _) = a.format.precision {
+                used_argument_names.insert(s);
+            }
+        }
+    }
+
+    for (symbol, (index, span)) in names {
+        if !used_argument_names.contains(symbol.as_str()) {
+            let msg = format!("named argument `{}` is not used by name", symbol.as_str());
+            let arg_span = cx.arg_spans.get(index).copied();
+            cx.ecx.buffered_early_lint.push(BufferedEarlyLint {
+                span: MultiSpan::from_span(span),
+                msg: msg.clone(),
+                node_id: ast::CRATE_NODE_ID,
+                lint_id: LintId::of(&NAMED_ARGUMENTS_USED_POSITIONALLY),
+                diagnostic: BuiltinLintDiagnostics::NamedArgumentUsedPositionally(
+                    arg_span,
+                    span,
+                    symbol.to_string(),
+                ),
+            });
+        }
+    }
+}
+
 /// Take the various parts of `format_args!(efmt, args..., name=names...)`
 /// and construct the appropriate formatting expression.
 pub fn expand_preparsed_format_args(
@@ -926,7 +1020,7 @@ pub fn expand_preparsed_format_args(
     sp: Span,
     efmt: P<ast::Expr>,
     args: Vec<P<ast::Expr>>,
-    names: FxHashMap<Symbol, usize>,
+    names: FxHashMap<Symbol, (usize, Span)>,
     append_newline: bool,
 ) -> P<ast::Expr> {
     // NOTE: this verbose way of initializing `Vec<Vec<ArgumentType>>` is because
@@ -993,7 +1087,7 @@ pub fn expand_preparsed_format_args(
     if !parser.errors.is_empty() {
         let err = parser.errors.remove(0);
         let sp = if efmt_kind_is_lit {
-            fmt_span.from_inner(err.span)
+            fmt_span.from_inner(InnerSpan::new(err.span.start, err.span.end))
         } else {
             // The format string could be another macro invocation, e.g.:
             //     format!(concat!("abc", "{}"), 4);
@@ -1012,20 +1106,30 @@ pub fn expand_preparsed_format_args(
         }
         if let Some((label, span)) = err.secondary_label {
             if efmt_kind_is_lit {
-                e.span_label(fmt_span.from_inner(span), label);
+                e.span_label(fmt_span.from_inner(InnerSpan::new(span.start, span.end)), label);
             }
         }
         e.emit();
         return DummyResult::raw_expr(sp, true);
     }
 
-    let arg_spans = parser.arg_places.iter().map(|span| fmt_span.from_inner(*span)).collect();
+    let arg_spans = parser
+        .arg_places
+        .iter()
+        .map(|span| fmt_span.from_inner(InnerSpan::new(span.start, span.end)))
+        .collect();
 
-    let named_pos: FxHashSet<usize> = names.values().cloned().collect();
+    let named_pos: FxHashSet<usize> = names.values().cloned().map(|(i, _)| i).collect();
+
+    // Clone `names` because `names` in Context get updated by verify_piece, which includes usages
+    // of the names of named arguments, resulting in incorrect errors if a name argument is used
+    // but not declared, such as: `println!("x = {x}");`
+    let named_arguments = names.clone();
 
     let mut cx = Context {
         ecx,
         args,
+        num_captured_args: 0,
         arg_types,
         arg_unique_types,
         names,
@@ -1048,9 +1152,11 @@ pub fn expand_preparsed_format_args(
         is_literal: parser.is_literal,
     };
 
-    // This needs to happen *after* the Parser has consumed all pieces to create all the spans
+    // This needs to happen *after* the Parser has consumed all pieces to create all the spans.
+    // unverified_pieces is used later to check named argument names are used, so clone each piece.
     let pieces = unverified_pieces
-        .into_iter()
+        .iter()
+        .cloned()
         .map(|mut piece| {
             cx.verify_piece(&piece);
             cx.resolve_name_inplace(&mut piece);
@@ -1212,7 +1318,44 @@ pub fn expand_preparsed_format_args(
         }
 
         diag.emit();
+    } else if cx.invalid_refs.is_empty() && !named_arguments.is_empty() {
+        // Only check for unused named argument names if there are no other errors to avoid causing
+        // too much noise in output errors, such as when a named argument is entirely unused.
+        // We also only need to perform this check if there are actually named arguments.
+        lint_named_arguments_used_positionally(named_arguments, &mut cx, unverified_pieces);
     }
 
     cx.into_expr()
+}
+
+fn may_contain_yield_point(e: &ast::Expr) -> bool {
+    struct MayContainYieldPoint(bool);
+
+    impl Visitor<'_> for MayContainYieldPoint {
+        fn visit_expr(&mut self, e: &ast::Expr) {
+            if let ast::ExprKind::Await(_) | ast::ExprKind::Yield(_) = e.kind {
+                self.0 = true;
+            } else {
+                visit::walk_expr(self, e);
+            }
+        }
+
+        fn visit_mac_call(&mut self, _: &ast::MacCall) {
+            self.0 = true;
+        }
+
+        fn visit_attribute(&mut self, _: &ast::Attribute) {
+            // Conservatively assume this may be a proc macro attribute in
+            // expression position.
+            self.0 = true;
+        }
+
+        fn visit_item(&mut self, _: &ast::Item) {
+            // Do not recurse into nested items.
+        }
+    }
+
+    let mut visitor = MayContainYieldPoint(false);
+    visitor.visit_expr(e);
+    visitor.0
 }

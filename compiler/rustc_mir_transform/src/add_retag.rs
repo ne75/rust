@@ -28,13 +28,15 @@ fn is_stable(place: PlaceRef<'_>) -> bool {
             ProjectionElem::Field { .. } |
             ProjectionElem::ConstantIndex { .. } |
             ProjectionElem::Subslice { .. } |
+            ProjectionElem::OpaqueCast { .. } |
             ProjectionElem::Downcast { .. } => true,
         }
     })
 }
 
-/// Determine whether this type may be a reference (or box), and thus needs retagging.
-fn may_be_reference(ty: Ty<'_>) -> bool {
+/// Determine whether this type may contain a reference (or box), and thus needs retagging.
+/// We will only recurse `depth` times into Tuples/ADTs to bound the cost of this.
+fn may_contain_reference<'tcx>(ty: Ty<'tcx>, depth: u32, tcx: TyCtxt<'tcx>) -> bool {
     match ty.kind() {
         // Primitive types that are not references
         ty::Bool
@@ -50,8 +52,20 @@ fn may_be_reference(ty: Ty<'_>) -> bool {
         // References
         ty::Ref(..) => true,
         ty::Adt(..) if ty.is_box() => true,
-        // Compound types are not references
-        ty::Array(..) | ty::Slice(..) | ty::Tuple(..) | ty::Adt(..) => false,
+        // Compound types: recurse
+        ty::Array(ty, _) | ty::Slice(ty) => {
+            // This does not branch so we keep the depth the same.
+            may_contain_reference(*ty, depth, tcx)
+        }
+        ty::Tuple(tys) => {
+            depth == 0 || tys.iter().any(|ty| may_contain_reference(ty, depth - 1, tcx))
+        }
+        ty::Adt(adt, subst) => {
+            depth == 0
+                || adt.variants().iter().any(|v| {
+                    v.fields.iter().any(|f| may_contain_reference(f.ty(tcx, subst), depth - 1, tcx))
+                })
+        }
         // Conservative fallback
         _ => true,
     }
@@ -59,7 +73,7 @@ fn may_be_reference(ty: Ty<'_>) -> bool {
 
 impl<'tcx> MirPass<'tcx> for AddRetag {
     fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
-        sess.opts.debugging_opts.mir_emit_retag
+        sess.opts.unstable_opts.mir_emit_retag
     }
 
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
@@ -67,11 +81,14 @@ impl<'tcx> MirPass<'tcx> for AddRetag {
         super::add_call_guards::AllCallEdges.run_pass(tcx, body);
 
         let (span, arg_count) = (body.span, body.arg_count);
-        let (basic_blocks, local_decls) = body.basic_blocks_and_local_decls_mut();
+        let basic_blocks = body.basic_blocks.as_mut();
+        let local_decls = &body.local_decls;
         let needs_retag = |place: &Place<'tcx>| {
             // FIXME: Instead of giving up for unstable places, we should introduce
             // a temporary and retag on that.
-            is_stable(place.as_ref()) && may_be_reference(place.ty(&*local_decls, tcx).ty)
+            is_stable(place.as_ref())
+                && may_contain_reference(place.ty(&*local_decls, tcx).ty, /*depth*/ 3, tcx)
+                && !local_decls[place.local].is_deref_temp()
         };
         let place_base_raw = |place: &Place<'tcx>| {
             // If this is a `Deref`, get the type of what we are deref'ing.
@@ -117,11 +134,11 @@ impl<'tcx> MirPass<'tcx> for AddRetag {
             .iter_mut()
             .filter_map(|block_data| {
                 match block_data.terminator().kind {
-                    TerminatorKind::Call { destination: Some(ref destination), .. }
-                        if needs_retag(&destination.0) =>
+                    TerminatorKind::Call { target: Some(target), destination, .. }
+                        if needs_retag(&destination) =>
                     {
                         // Remember the return destination for later
-                        Some((block_data.terminator().source_info, destination.0, destination.1))
+                        Some((block_data.terminator().source_info, destination, target))
                     }
 
                     // `Drop` is also a call, but it doesn't return anything so we are good.

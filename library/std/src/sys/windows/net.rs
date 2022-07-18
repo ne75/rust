@@ -2,13 +2,13 @@
 
 use crate::cmp;
 use crate::io::{self, IoSlice, IoSliceMut, Read};
-use crate::lazy::SyncOnceCell;
 use crate::mem;
 use crate::net::{Shutdown, SocketAddr};
 use crate::os::windows::io::{
     AsRawSocket, AsSocket, BorrowedSocket, FromRawSocket, IntoRawSocket, OwnedSocket, RawSocket,
 };
 use crate::ptr;
+use crate::sync::OnceLock;
 use crate::sys;
 use crate::sys::c;
 use crate::sys_common::net;
@@ -29,7 +29,7 @@ pub mod netc {
 
 pub struct Socket(OwnedSocket);
 
-static WSA_CLEANUP: SyncOnceCell<unsafe extern "system" fn() -> i32> = SyncOnceCell::new();
+static WSA_CLEANUP: OnceLock<unsafe extern "system" fn() -> i32> = OnceLock::new();
 
 /// Checks whether the Windows socket interface has been started already, and
 /// if not, starts it.
@@ -152,9 +152,9 @@ impl Socket {
         match result {
             Err(ref error) if error.kind() == io::ErrorKind::WouldBlock => {
                 if timeout.as_secs() == 0 && timeout.subsec_nanos() == 0 {
-                    return Err(io::Error::new_const(
+                    return Err(io::const_io_error!(
                         io::ErrorKind::InvalidInput,
-                        &"cannot set a 0 duration timeout",
+                        "cannot set a 0 duration timeout",
                     ));
                 }
 
@@ -185,9 +185,7 @@ impl Socket {
                 };
 
                 match count {
-                    0 => {
-                        Err(io::Error::new_const(io::ErrorKind::TimedOut, &"connection timed out"))
-                    }
+                    0 => Err(io::const_io_error!(io::ErrorKind::TimedOut, "connection timed out")),
                     _ => {
                         if writefds.fd_count != 1 {
                             if let Some(e) = self.take_error()? {
@@ -353,9 +351,9 @@ impl Socket {
             Some(dur) => {
                 let timeout = sys::dur2timeout(dur);
                 if timeout == 0 {
-                    return Err(io::Error::new_const(
+                    return Err(io::const_io_error!(
                         io::ErrorKind::InvalidInput,
-                        &"cannot set a 0 duration timeout",
+                        "cannot set a 0 duration timeout",
                     ));
                 }
                 timeout
@@ -409,11 +407,11 @@ impl Socket {
     }
 
     pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
-        net::setsockopt(self, c::IPPROTO_TCP, c::TCP_NODELAY, nodelay as c::BYTE)
+        net::setsockopt(self, c::IPPROTO_TCP, c::TCP_NODELAY, nodelay as c::BOOL)
     }
 
     pub fn nodelay(&self) -> io::Result<bool> {
-        let raw: c::BYTE = net::getsockopt(self, c::IPPROTO_TCP, c::TCP_NODELAY)?;
+        let raw: c::BOOL = net::getsockopt(self, c::IPPROTO_TCP, c::TCP_NODELAY)?;
         Ok(raw != 0)
     }
 

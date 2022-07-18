@@ -1,5 +1,5 @@
 use rustc_middle::mir::interpret::InterpResult;
-use rustc_middle::ty::{self, Ty, TyCtxt, TypeFoldable, TypeVisitor};
+use rustc_middle::ty::{self, Ty, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisitor};
 use std::convert::TryInto;
 use std::ops::ControlFlow;
 
@@ -8,9 +8,9 @@ use std::ops::ControlFlow;
 /// In case it does, returns a `TooGeneric` const eval error. Note that due to polymorphization
 /// types may be "concrete enough" even though they still contain generic parameters in
 /// case these parameters are unused.
-crate fn ensure_monomorphic_enough<'tcx, T>(tcx: TyCtxt<'tcx>, ty: T) -> InterpResult<'tcx>
+pub(crate) fn ensure_monomorphic_enough<'tcx, T>(tcx: TyCtxt<'tcx>, ty: T) -> InterpResult<'tcx>
 where
-    T: TypeFoldable<'tcx>,
+    T: TypeVisitable<'tcx>,
 {
     debug!("ensure_monomorphic_enough: ty={:?}", ty);
     if !ty.needs_subst() {
@@ -44,22 +44,10 @@ where
                         let is_used = unused_params.contains(index).map_or(true, |unused| !unused);
                         // Only recurse when generic parameters in fns, closures and generators
                         // are used and require substitution.
-                        match (is_used, subst.needs_subst()) {
-                            // Just in case there are closures or generators within this subst,
-                            // recurse.
-                            (true, true) => return subst.super_visit_with(self),
-                            // Confirm that polymorphization replaced the parameter with
-                            // `ty::Param`/`ty::ConstKind::Param`.
-                            (false, true) if cfg!(debug_assertions) => match subst.unpack() {
-                                ty::subst::GenericArgKind::Type(ty) => {
-                                    assert!(matches!(ty.kind(), ty::Param(_)))
-                                }
-                                ty::subst::GenericArgKind::Const(ct) => {
-                                    assert!(matches!(ct.val, ty::ConstKind::Param(_)))
-                                }
-                                ty::subst::GenericArgKind::Lifetime(..) => (),
-                            },
-                            _ => {}
+                        // Just in case there are closures or generators within this subst,
+                        // recurse.
+                        if is_used && subst.needs_subst() {
+                            return subst.visit_with(self);
                         }
                     }
                     ControlFlow::CONTINUE
@@ -68,8 +56,8 @@ where
             }
         }
 
-        fn visit_const(&mut self, c: &'tcx ty::Const<'tcx>) -> ControlFlow<Self::BreakTy> {
-            match c.val {
+        fn visit_const(&mut self, c: ty::Const<'tcx>) -> ControlFlow<Self::BreakTy> {
+            match c.kind() {
                 ty::ConstKind::Param(..) => ControlFlow::Break(FoundParam),
                 _ => c.super_visit_with(self),
             }

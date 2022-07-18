@@ -5,7 +5,7 @@ use clippy_utils::visitors::is_local_used;
 use clippy_utils::{path_to_local_id, paths, peel_blocks, peel_ref_operators, strip_pat_refs};
 use if_chain::if_chain;
 use rustc_errors::Applicability;
-use rustc_hir::{BinOpKind, Expr, ExprKind, PatKind};
+use rustc_hir::{BinOpKind, Closure, Expr, ExprKind, PatKind};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::ty::{self, UintTy};
 use rustc_session::{declare_lint_pass, declare_tool_lint};
@@ -28,7 +28,13 @@ declare_clippy_lint! {
     /// ### Example
     /// ```rust
     /// # let vec = vec![1_u8];
-    /// &vec.iter().filter(|x| **x == 0u8).count(); // use bytecount::count instead
+    /// let count = vec.iter().filter(|x| **x == 0u8).count();
+    /// ```
+    ///
+    /// Use instead:
+    /// ```rust,ignore
+    /// # let vec = vec![1_u8];
+    /// let count = bytecount::count(&vec, 0u8);
     /// ```
     #[clippy::version = "pre 1.29.0"]
     pub NAIVE_BYTECOUNT,
@@ -45,8 +51,8 @@ impl<'tcx> LateLintPass<'tcx> for ByteCount {
             if count.ident.name == sym::count;
             if let ExprKind::MethodCall(filter, [filter_recv, filter_arg], _) = count_recv.kind;
             if filter.ident.name == sym!(filter);
-            if let ExprKind::Closure(_, _, body_id, _, _) = filter_arg.kind;
-            let body = cx.tcx.hir().body(body_id);
+            if let ExprKind::Closure(&Closure { body, .. }) = filter_arg.kind;
+            let body = cx.tcx.hir().body(body);
             if let [param] = body.params;
             if let PatKind::Binding(_, arg_id, _, _) = strip_pat_refs(param.pat).kind;
             if let ExprKind::Binary(ref op, l, r) = body.value.kind;

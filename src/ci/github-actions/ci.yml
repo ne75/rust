@@ -99,7 +99,7 @@ x--expand-yaml-anchors--remove:
         run: git config --global core.autocrlf false
 
       - name: checkout the source code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
         with:
           fetch-depth: 2
 
@@ -161,12 +161,12 @@ x--expand-yaml-anchors--remove:
         run: src/ci/scripts/install-wix.sh
         <<: *step
 
-      - name: ensure the build happens on a partition with enough space
-        run: src/ci/scripts/symlink-build-dir.sh
-        <<: *step
-
       - name: disable git crlf conversion
         run: src/ci/scripts/disable-git-crlf-conversion.sh
+        <<: *step
+
+      - name: checkout submodules
+        run: src/ci/scripts/checkout-submodules.sh
         <<: *step
 
       - name: install MSYS2
@@ -192,10 +192,6 @@ x--expand-yaml-anchors--remove:
       # appropriate line endings.
       - name: disable git crlf conversion
         run: src/ci/scripts/disable-git-crlf-conversion.sh
-        <<: *step
-
-      - name: checkout submodules
-        run: src/ci/scripts/checkout-submodules.sh
         <<: *step
 
       - name: ensure line endings are correct
@@ -486,9 +482,9 @@ jobs:
               NO_OVERFLOW_CHECKS: 1
             <<: *job-macos-xl
 
-          - name: x86_64-apple
-            env:
-              SCRIPT: ./x.py --stage 2 test
+          - name: x86_64-apple-1
+            env: &env-x86_64-apple-tests
+              SCRIPT: ./x.py --stage 2 test --exclude src/test/ui --exclude src/test/rustdoc --exclude src/test/run-make-fulldeps
               RUST_CONFIGURE_ARGS: --build=x86_64-apple-darwin --enable-sanitizers --enable-profiler --set rust.jemalloc --set llvm.ninja=false
               RUSTC_RETRY_LINKER_ON_SEGFAULT: 1
               MACOSX_DEPLOYMENT_TARGET: 10.8
@@ -496,6 +492,12 @@ jobs:
               NO_LLVM_ASSERTIONS: 1
               NO_DEBUG_ASSERTIONS: 1
               NO_OVERFLOW_CHECKS: 1
+            <<: *job-macos-xl
+
+          - name: x86_64-apple-2
+            env:
+              SCRIPT: ./x.py --stage 2 test src/test/ui src/test/rustdoc src/test/run-make-fulldeps
+              <<: *env-x86_64-apple-tests
             <<: *job-macos-xl
 
           # This target only needs to support 11.0 and up as nothing else supports the hardware
@@ -623,7 +625,7 @@ jobs:
                 --target=x86_64-pc-windows-msvc
                 --enable-full-tools
                 --enable-profiler
-              SCRIPT: python x.py dist
+              SCRIPT: PGO_HOST=x86_64-pc-windows-msvc src/ci/pgo.sh python x.py dist
               DIST_REQUIRE_ALL_TOOLS: 1
             <<: *job-windows-xl
 
@@ -697,7 +699,7 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/master' && github.repository == 'rust-lang-ci/rust'
     steps:
       - name: checkout the source code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
         with:
           fetch-depth: 2
 

@@ -1,5 +1,5 @@
-use crate::pp::Breaks::{Consistent, Inconsistent};
-use crate::pprust::state::{AnnNode, PrintState, State, INDENT_UNIT};
+use crate::pp::Breaks::Inconsistent;
+use crate::pprust::state::{AnnNode, IterDelimited, PrintState, State, INDENT_UNIT};
 
 use rustc_ast::ptr::P;
 use rustc_ast::util::parser::{self, AssocOp, Fixity};
@@ -64,7 +64,10 @@ impl<'a> State<'a> {
     // parses as the erroneous construct `if (return {})`, not `if (return) {}`.
     pub(super) fn cond_needs_par(expr: &ast::Expr) -> bool {
         match expr.kind {
-            ast::ExprKind::Break(..) | ast::ExprKind::Closure(..) | ast::ExprKind::Ret(..) => true,
+            ast::ExprKind::Break(..)
+            | ast::ExprKind::Closure(..)
+            | ast::ExprKind::Ret(..)
+            | ast::ExprKind::Yeet(..) => true,
             _ => parser::contains_exterior_struct_lit(expr),
         }
     }
@@ -88,10 +91,21 @@ impl<'a> State<'a> {
         self.end();
     }
 
-    pub(super) fn print_expr_anon_const(&mut self, expr: &ast::AnonConst) {
+    pub(super) fn print_expr_anon_const(
+        &mut self,
+        expr: &ast::AnonConst,
+        attrs: &[ast::Attribute],
+    ) {
         self.ibox(INDENT_UNIT);
         self.word("const");
-        self.print_expr(&expr.value);
+        self.nbsp();
+        if let ast::ExprKind::Block(block, None) = &expr.value.kind {
+            self.cbox(0);
+            self.ibox(0);
+            self.print_block_with_attrs(block, attrs);
+        } else {
+            self.print_expr(&expr.value);
+        }
         self.end();
     }
 
@@ -117,38 +131,46 @@ impl<'a> State<'a> {
         } else {
             self.print_path(path, true, 0);
         }
+        self.nbsp();
         self.word("{");
-        self.commasep_cmnt(
-            Consistent,
-            fields,
-            |s, field| {
-                s.print_outer_attributes(&field.attrs);
-                s.ibox(INDENT_UNIT);
-                if !field.is_shorthand {
-                    s.print_ident(field.ident);
-                    s.word_space(":");
-                }
-                s.print_expr(&field.expr);
-                s.end();
-            },
-            |f| f.span,
-        );
-        match rest {
-            ast::StructRest::Base(_) | ast::StructRest::Rest(_) => {
-                self.ibox(INDENT_UNIT);
-                if !fields.is_empty() {
-                    self.word(",");
-                    self.space();
-                }
-                self.word("..");
-                if let ast::StructRest::Base(ref expr) = *rest {
-                    self.print_expr(expr);
-                }
-                self.end();
-            }
-            ast::StructRest::None if !fields.is_empty() => self.word(","),
-            _ => {}
+        let has_rest = match rest {
+            ast::StructRest::Base(_) | ast::StructRest::Rest(_) => true,
+            ast::StructRest::None => false,
+        };
+        if fields.is_empty() && !has_rest {
+            self.word("}");
+            return;
         }
+        self.cbox(0);
+        for field in fields.iter().delimited() {
+            self.maybe_print_comment(field.span.hi());
+            self.print_outer_attributes(&field.attrs);
+            if field.is_first {
+                self.space_if_not_bol();
+            }
+            if !field.is_shorthand {
+                self.print_ident(field.ident);
+                self.word_nbsp(":");
+            }
+            self.print_expr(&field.expr);
+            if !field.is_last || has_rest {
+                self.word_space(",");
+            } else {
+                self.trailing_comma_or_space();
+            }
+        }
+        if has_rest {
+            if fields.is_empty() {
+                self.space();
+            }
+            self.word("..");
+            if let ast::StructRest::Base(expr) = rest {
+                self.print_expr(expr);
+            }
+            self.space();
+        }
+        self.offset(-INDENT_UNIT);
+        self.end();
         self.word("}");
     }
 
@@ -267,7 +289,7 @@ impl<'a> State<'a> {
                 self.print_expr_vec(exprs);
             }
             ast::ExprKind::ConstBlock(ref anon_const) => {
-                self.print_expr_anon_const(anon_const);
+                self.print_expr_anon_const(anon_const, attrs);
             }
             ast::ExprKind::Repeat(ref element, ref count) => {
                 self.print_expr_repeat(element, count);
@@ -320,7 +342,9 @@ impl<'a> State<'a> {
                     self.print_ident(label.ident);
                     self.word_space(":");
                 }
-                self.head("while");
+                self.cbox(0);
+                self.ibox(0);
+                self.word_nbsp("while");
                 self.print_expr_as_cond(test);
                 self.space();
                 self.print_block_with_attrs(blk, attrs);
@@ -330,7 +354,9 @@ impl<'a> State<'a> {
                     self.print_ident(label.ident);
                     self.word_space(":");
                 }
-                self.head("for");
+                self.cbox(0);
+                self.ibox(0);
+                self.word_nbsp("for");
                 self.print_pat(pat);
                 self.space();
                 self.word_space("in");
@@ -343,12 +369,14 @@ impl<'a> State<'a> {
                     self.print_ident(label.ident);
                     self.word_space(":");
                 }
-                self.head("loop");
+                self.cbox(0);
+                self.ibox(0);
+                self.word_nbsp("loop");
                 self.print_block_with_attrs(blk, attrs);
             }
             ast::ExprKind::Match(ref expr, ref arms) => {
-                self.cbox(INDENT_UNIT);
-                self.ibox(INDENT_UNIT);
+                self.cbox(0);
+                self.ibox(0);
                 self.word_nbsp("match");
                 self.print_expr_as_cond(expr);
                 self.space();
@@ -361,6 +389,7 @@ impl<'a> State<'a> {
                 self.bclose(expr.span, empty);
             }
             ast::ExprKind::Closure(
+                ref binder,
                 capture_clause,
                 asyncness,
                 movability,
@@ -368,6 +397,7 @@ impl<'a> State<'a> {
                 ref body,
                 _,
             ) => {
+                self.print_closure_binder(binder);
                 self.print_movability(movability);
                 self.print_asyncness(asyncness);
                 self.print_capture_clause(capture_clause);
@@ -388,7 +418,7 @@ impl<'a> State<'a> {
                     self.word_space(":");
                 }
                 // containing cbox, will be closed by print-block at }
-                self.cbox(INDENT_UNIT);
+                self.cbox(0);
                 // head-box, will be closed by print-block after {
                 self.ibox(0);
                 self.print_block_with_attrs(blk, attrs);
@@ -397,7 +427,7 @@ impl<'a> State<'a> {
                 self.word_nbsp("async");
                 self.print_capture_clause(capture_clause);
                 // cbox/ibox in analogy to the `ExprKind::Block` arm above
-                self.cbox(INDENT_UNIT);
+                self.cbox(0);
                 self.ibox(0);
                 self.print_block_with_attrs(blk, attrs);
             }
@@ -477,6 +507,15 @@ impl<'a> State<'a> {
                     self.print_expr_maybe_paren(expr, parser::PREC_JUMP);
                 }
             }
+            ast::ExprKind::Yeet(ref result) => {
+                self.word("do");
+                self.word(" ");
+                self.word("yeet");
+                if let Some(ref expr) = *result {
+                    self.word(" ");
+                    self.print_expr_maybe_paren(expr, parser::PREC_JUMP);
+                }
+            }
             ast::ExprKind::InlineAsm(ref a) => {
                 self.word("asm!");
                 self.print_inline_asm(a);
@@ -500,7 +539,9 @@ impl<'a> State<'a> {
                 self.word("?")
             }
             ast::ExprKind::TryBlock(ref blk) => {
-                self.head("try");
+                self.cbox(0);
+                self.ibox(0);
+                self.word_nbsp("try");
                 self.print_block_with_attrs(blk, attrs)
             }
             ast::ExprKind::Err => {
@@ -553,6 +594,15 @@ impl<'a> State<'a> {
             }
         }
         self.end(); // Close enclosing cbox.
+    }
+
+    fn print_closure_binder(&mut self, binder: &ast::ClosureBinder) {
+        match binder {
+            ast::ClosureBinder::NotPresent => {}
+            ast::ClosureBinder::For { generic_params, .. } => {
+                self.print_formal_generic_params(&generic_params)
+            }
+        }
     }
 
     fn print_movability(&mut self, movability: ast::Movability) {

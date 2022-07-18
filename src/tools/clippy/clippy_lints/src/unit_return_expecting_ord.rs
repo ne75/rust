@@ -2,7 +2,7 @@ use clippy_utils::diagnostics::{span_lint, span_lint_and_help};
 use clippy_utils::{get_trait_def_id, paths};
 use if_chain::if_chain;
 use rustc_hir::def_id::DefId;
-use rustc_hir::{Expr, ExprKind, StmtKind};
+use rustc_hir::{Closure, Expr, ExprKind, StmtKind};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::ty;
 use rustc_middle::ty::{GenericPredicates, PredicateKind, ProjectionPredicate, TraitPredicate};
@@ -84,7 +84,8 @@ fn get_args_to_check<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) -> Ve
         let partial_ord_preds =
             get_trait_predicates_for_trait_id(cx, generics, cx.tcx.lang_items().partial_ord_trait());
         // Trying to call erase_late_bound_regions on fn_sig.inputs() gives the following error
-        // The trait `rustc::ty::TypeFoldable<'_>` is not implemented for `&[&rustc::ty::TyS<'_>]`
+        // The trait `rustc::ty::TypeFoldable<'_>` is not implemented for
+        // `&[rustc_middle::ty::Ty<'_>]`
         let inputs_output = cx.tcx.erase_late_bound_regions(fn_sig.inputs_and_output());
         inputs_output
             .iter()
@@ -115,13 +116,13 @@ fn get_args_to_check<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) -> Ve
 
 fn check_arg<'tcx>(cx: &LateContext<'tcx>, arg: &'tcx Expr<'tcx>) -> Option<(Span, Option<Span>)> {
     if_chain! {
-        if let ExprKind::Closure(_, _fn_decl, body_id, span, _) = arg.kind;
+        if let ExprKind::Closure(&Closure { body, fn_decl_span, .. }) = arg.kind;
         if let ty::Closure(_def_id, substs) = &cx.typeck_results().node_type(arg.hir_id).kind();
         let ret_ty = substs.as_closure().sig().output();
         let ty = cx.tcx.erase_late_bound_regions(ret_ty);
         if ty.is_unit();
         then {
-            let body = cx.tcx.hir().body(body_id);
+            let body = cx.tcx.hir().body(body);
             if_chain! {
                 if let ExprKind::Block(block, _) = body.value.kind;
                 if block.expr.is_none();
@@ -130,9 +131,9 @@ fn check_arg<'tcx>(cx: &LateContext<'tcx>, arg: &'tcx Expr<'tcx>) -> Option<(Spa
                 then {
                     let data = stmt.span.data();
                     // Make a span out of the semicolon for the help message
-                    Some((span, Some(data.with_lo(data.hi-BytePos(1)))))
+                    Some((fn_decl_span, Some(data.with_lo(data.hi-BytePos(1)))))
                 } else {
-                    Some((span, None))
+                    Some((fn_decl_span, None))
                 }
             }
         } else {

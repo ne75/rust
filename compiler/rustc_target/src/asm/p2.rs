@@ -35,7 +35,7 @@ impl P2InlineAsmRegClass {
         arch: InlineAsmArch,
     ) -> &'static [(InlineAsmType, Option<Symbol>)] {
         match (self, arch) {
-            (Self::reg, _) => types! { _: I8, I16; },
+            (Self::reg, _) => types! { _: I8, I16, I32; },
         }
     }
 }
@@ -91,7 +91,6 @@ def_regs! {
         outb: reg = ["outb"],
         ina:  reg = ["ina"],
         inb:  reg = ["inb"],
-    
     }
 }
 

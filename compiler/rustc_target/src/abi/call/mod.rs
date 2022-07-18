@@ -16,6 +16,7 @@ mod mips64;
 mod msp430;
 mod nvptx;
 mod nvptx64;
+mod p2;
 mod powerpc;
 mod powerpc64;
 mod riscv;
@@ -26,7 +27,6 @@ mod wasm;
 mod x86;
 mod x86_64;
 mod x86_win64;
-mod p2;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, HashStable_Generic)]
 pub enum PassMode {

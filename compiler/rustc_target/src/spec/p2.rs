@@ -1,4 +1,6 @@
-use crate::spec::{LinkerFlavor, LldFlavor, RelocModel, Endian, PanicStrategy, Target, TargetOptions};
+use crate::spec::{
+    Endian, LinkerFlavor, LldFlavor, PanicStrategy, RelocModel, Target, TargetOptions,
+};
 
 /// A base target for P2 devices using the LLVM toolchain.
 pub fn target() -> Target {

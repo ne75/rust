@@ -332,7 +332,7 @@ impl InlineAsmReg {
                 Self::Wasm(WasmInlineAsmReg::parse(name)?)
             }
             InlineAsmArch::P2 => {
-                Self::P2(P2InlineAsmReg::parse(arch, target_features, target, name)?)
+                Self::P2(P2InlineAsmReg::parse(name)?)
             }
             InlineAsmArch::Bpf => Self::Bpf(BpfInlineAsmReg::parse(name)?),
             InlineAsmArch::Avr => Self::Avr(AvrInlineAsmReg::parse(name)?),
@@ -360,6 +360,7 @@ impl InlineAsmReg {
             Self::Bpf(r) => r.validate(arch, reloc_model, target_features, target, is_clobber),
             Self::Avr(r) => r.validate(arch, reloc_model, target_features, target, is_clobber),
             Self::Msp430(r) => r.validate(arch, reloc_model, target_features, target, is_clobber),
+            Self::P2(r) => r.validate(arch, reloc_model, target_features, target, is_clobber),
             Self::Err => unreachable!(),
         }
     }
@@ -583,13 +584,10 @@ impl InlineAsmRegClass {
             InlineAsmArch::Wasm32 | InlineAsmArch::Wasm64 => {
                 Self::Wasm(WasmInlineAsmRegClass::parse(name)?)
             }
-            InlineAsmArch::Bpf => Self::Bpf(BpfInlineAsmRegClass::parse(arch, name)?),
-            InlineAsmArch::Avr => Self::Avr(AvrInlineAsmRegClass::parse(arch, name)?),
-            InlineAsmArch::Msp430 => Self::Msp430(Msp430InlineAsmRegClass::parse(arch, name)?),
-            InlineAsmArch::P2 => Self::P2(P2InlineAsmRegClass::parse(arch, name)?),
             InlineAsmArch::Bpf => Self::Bpf(BpfInlineAsmRegClass::parse(name)?),
             InlineAsmArch::Avr => Self::Avr(AvrInlineAsmRegClass::parse(name)?),
             InlineAsmArch::Msp430 => Self::Msp430(Msp430InlineAsmRegClass::parse(name)?),
+            InlineAsmArch::P2 => Self::P2(P2InlineAsmRegClass::parse(name)?),
         })
     }
 
@@ -800,7 +798,7 @@ pub fn allocatable_registers(
         }
         InlineAsmArch::P2 => {
             let mut map = p2::regclass_map();
-            p2::fill_reg_map(arch, target_features, target, &mut map);
+            p2::fill_reg_map(arch, reloc_model, target_features, target, &mut map);
             map
         }
     }

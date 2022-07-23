@@ -1,0 +1,14 @@
+{
+    "arch": "p2",
+    "data-layout": "e-p:32:32-i32:32-i64:32",
+    "llvm-target": "p2",
+    "target-pointer-width": "32",
+  
+    "target-endian": "little",
+    "executables": true,
+    "linker-flavor": "ld.lld",
+  
+    "position-independent-executables": false,
+    "exe-suffix": ".elf",
+    "eh-frame-header": false
+  } 

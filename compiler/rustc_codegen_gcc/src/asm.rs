@@ -599,6 +599,7 @@ fn reg_to_gcc(reg: InlineAsmRegOrRegClass) -> ConstraintOrRegister {
             }
             InlineAsmRegClass::S390x(S390xInlineAsmRegClass::reg) => unimplemented!(),
             InlineAsmRegClass::S390x(S390xInlineAsmRegClass::freg) => unimplemented!(),
+            InlineAsmRegClass::P2(_) => unimplemented!(),
             InlineAsmRegClass::Err => unreachable!(),
         }
     };

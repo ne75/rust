@@ -186,4 +186,12 @@ pub fn initialize_available_targets() {
         LLVMInitializeBPFAsmPrinter,
         LLVMInitializeBPFAsmParser
     );
+    init_target!(
+        llvm_component = "p2",
+        LLVMInitializeP2TargetInfo,
+        LLVMInitializeP2Target,
+        LLVMInitializeP2TargetMC,
+        LLVMInitializeP2AsmPrinter,
+        LLVMInitializeP2AsmParser
+    );
 }

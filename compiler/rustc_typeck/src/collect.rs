@@ -1929,7 +1929,7 @@ fn infer_return_ty_for_fn_sig<'tcx>(
             visitor.visit_ty(ty);
             let mut diag = bad_placeholder(tcx, visitor.0, "return type");
             let ret_ty = fn_sig.skip_binder().output();
-            if ret_ty.is_suggestable(tcx) {
+            if ret_ty.is_suggestable(tcx, false) {
                 diag.span_suggestion(
                     ty.span,
                     "replace with the correct return type",
@@ -1938,7 +1938,12 @@ fn infer_return_ty_for_fn_sig<'tcx>(
                 );
             } else if matches!(ret_ty.kind(), ty::FnDef(..)) {
                 let fn_sig = ret_ty.fn_sig(tcx);
-                if fn_sig.skip_binder().inputs_and_output.iter().all(|t| t.is_suggestable(tcx)) {
+                if fn_sig
+                    .skip_binder()
+                    .inputs_and_output
+                    .iter()
+                    .all(|t| t.is_suggestable(tcx, false))
+                {
                     diag.span_suggestion(
                         ty.span,
                         "replace with the correct return type",
@@ -2813,7 +2818,37 @@ fn codegen_fn_attrs(tcx: TyCtxt<'_>, did: DefId) -> CodegenFnAttrs {
                         )
                         .emit();
                 }
-                None => codegen_fn_attrs.flags |= CodegenFnAttrFlags::USED,
+                None => {
+                    // Unfortunately, unconditionally using `llvm.used` causes
+                    // issues in handling `.init_array` with the gold linker,
+                    // but using `llvm.compiler.used` caused a nontrival amount
+                    // of unintentional ecosystem breakage -- particularly on
+                    // Mach-O targets.
+                    //
+                    // As a result, we emit `llvm.compiler.used` only on ELF
+                    // targets. This is somewhat ad-hoc, but actually follows
+                    // our pre-LLVM 13 behavior (prior to the ecosystem
+                    // breakage), and seems to match `clang`'s behavior as well
+                    // (both before and after LLVM 13), possibly because they
+                    // have similar compatibility concerns to us. See
+                    // https://github.com/rust-lang/rust/issues/47384#issuecomment-1019080146
+                    // and following comments for some discussion of this, as
+                    // well as the comments in `rustc_codegen_llvm` where these
+                    // flags are handled.
+                    //
+                    // Anyway, to be clear: this is still up in the air
+                    // somewhat, and is subject to change in the future (which
+                    // is a good thing, because this would ideally be a bit
+                    // more firmed up).
+                    let is_like_elf = !(tcx.sess.target.is_like_osx
+                        || tcx.sess.target.is_like_windows
+                        || tcx.sess.target.is_like_wasm);
+                    codegen_fn_attrs.flags = if is_like_elf {
+                        CodegenFnAttrFlags::USED
+                    } else {
+                        CodegenFnAttrFlags::USED_LINKER
+                    };
+                }
             }
         } else if attr.has_name(sym::cmse_nonsecure_entry) {
             if !matches!(tcx.fn_sig(did).abi(), abi::Abi::C { .. }) {

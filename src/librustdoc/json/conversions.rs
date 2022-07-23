@@ -43,7 +43,7 @@ impl JsonRenderer<'_> {
         let span = item.span(self.tcx);
         let clean::Item { name, attrs: _, kind: _, visibility, item_id, cfg: _ } = item;
         let inner = match *item.kind {
-            clean::KeywordItem(_) => return None,
+            clean::KeywordItem => return None,
             clean::StrippedItem(ref inner) => {
                 match &**inner {
                     // We document non-empty stripped modules as with `Module::is_stripped` set to
@@ -269,7 +269,7 @@ fn from_clean_item(item: clean::Item, tcx: TyCtxt<'_>) -> ItemEnum {
             default: Some(t.item_type.unwrap_or(t.type_).into_tcx(tcx)),
         },
         // `convert_item` early returns `None` for stripped items and keywords.
-        KeywordItem(_) => unreachable!(),
+        KeywordItem => unreachable!(),
         StrippedItem(inner) => {
             match *inner {
                 ModuleItem(m) => ItemEnum::Module(Module {
@@ -554,10 +554,12 @@ impl FromWithTcx<clean::FnDecl> for FnDecl {
 
 impl FromWithTcx<clean::Trait> for Trait {
     fn from_tcx(trait_: clean::Trait, tcx: TyCtxt<'_>) -> Self {
-        let clean::Trait { unsafety, items, generics, bounds, is_auto } = trait_;
+        let is_auto = trait_.is_auto(tcx);
+        let is_unsafe = trait_.unsafety(tcx) == rustc_hir::Unsafety::Unsafe;
+        let clean::Trait { items, generics, bounds, .. } = trait_;
         Trait {
             is_auto,
-            is_unsafe: unsafety == rustc_hir::Unsafety::Unsafe,
+            is_unsafe,
             items: ids(items, tcx),
             generics: generics.into_tcx(tcx),
             bounds: bounds.into_iter().map(|x| x.into_tcx(tcx)).collect(),
@@ -574,7 +576,7 @@ impl FromWithTcx<clean::Impl> for Impl {
         let trait_ = trait_.map(|path| clean::Type::Path { path }.into_tcx(tcx));
         // FIXME: use something like ImplKind in JSON?
         let (synthetic, blanket_impl) = match kind {
-            clean::ImplKind::Normal | clean::ImplKind::TupleVaradic => (false, None),
+            clean::ImplKind::Normal | clean::ImplKind::FakeVaradic => (false, None),
             clean::ImplKind::Auto => (true, None),
             clean::ImplKind::Blanket(ty) => (false, Some(*ty)),
         };

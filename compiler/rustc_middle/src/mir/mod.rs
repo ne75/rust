@@ -1397,7 +1397,6 @@ impl<V, T> ProjectionElem<V, T> {
 
             Self::Field(_, _)
             | Self::Index(_)
-            | Self::OpaqueCast(_)
             | Self::ConstantIndex { .. }
             | Self::Subslice { .. }
             | Self::Downcast(_, _) => false,
@@ -1575,9 +1574,7 @@ impl Debug for Place<'_> {
     fn fmt(&self, fmt: &mut Formatter<'_>) -> fmt::Result {
         for elem in self.projection.iter().rev() {
             match elem {
-                ProjectionElem::OpaqueCast(_)
-                | ProjectionElem::Downcast(_, _)
-                | ProjectionElem::Field(_, _) => {
+                ProjectionElem::Downcast(_, _) | ProjectionElem::Field(_, _) => {
                     write!(fmt, "(").unwrap();
                 }
                 ProjectionElem::Deref => {
@@ -1593,9 +1590,6 @@ impl Debug for Place<'_> {
 
         for elem in self.projection.iter() {
             match elem {
-                ProjectionElem::OpaqueCast(ty) => {
-                    write!(fmt, " as {})", ty)?;
-                }
                 ProjectionElem::Downcast(Some(name), _index) => {
                     write!(fmt, " as {})", name)?;
                 }
@@ -1666,6 +1660,22 @@ impl SourceScope {
         match &data.local_data {
             ClearCrossCrate::Set(data) => Some(data.lint_root),
             ClearCrossCrate::Clear => None,
+        }
+    }
+
+    /// The instance this source scope was inlined from, if any.
+    #[inline]
+    pub fn inlined_instance<'tcx>(
+        self,
+        source_scopes: &IndexVec<SourceScope, SourceScopeData<'tcx>>,
+    ) -> Option<ty::Instance<'tcx>> {
+        let scope_data = &source_scopes[self];
+        if let Some((inlined_instance, _)) = scope_data.inlined {
+            Some(inlined_instance)
+        } else if let Some(inlined_scope) = scope_data.inlined_parent_scope {
+            Some(source_scopes[inlined_scope].inlined.unwrap().0)
+        } else {
+            None
         }
     }
 }

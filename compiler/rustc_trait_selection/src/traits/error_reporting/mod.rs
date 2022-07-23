@@ -22,7 +22,6 @@ use rustc_hir::intravisit::Visitor;
 use rustc_hir::GenericParam;
 use rustc_hir::Item;
 use rustc_hir::Node;
-use rustc_infer::infer::error_reporting::same_type_modulo_infer;
 use rustc_infer::traits::TraitEngine;
 use rustc_middle::traits::select::OverflowError;
 use rustc_middle::ty::abstract_const::NotConstEvaluatable;
@@ -474,7 +473,7 @@ impl<'a, 'tcx> InferCtxtExt<'tcx> for InferCtxt<'a, 'tcx> {
                         if let Some(ref s) = label {
                             // If it has a custom `#[rustc_on_unimplemented]`
                             // error message, let's display it as the label!
-                            err.span_label(span, s.as_str());
+                            err.span_label(span, s);
                             if !matches!(trait_ref.skip_binder().self_ty().kind(), ty::Param(_)) {
                                 // When the self type is a type param We don't need to "the trait
                                 // `std::marker::Sized` is not implemented for `T`" as we will point
@@ -531,7 +530,7 @@ impl<'a, 'tcx> InferCtxtExt<'tcx> for InferCtxt<'a, 'tcx> {
                             let enclosing_scope_span =
                                 tcx.hir().span_with_body(tcx.hir().local_def_id_to_hir_id(body));
 
-                            err.span_label(enclosing_scope_span, s.as_str());
+                            err.span_label(enclosing_scope_span, s);
                         }
 
                         self.suggest_floating_point_literal(&obligation, &mut err, &trait_ref);
@@ -640,7 +639,7 @@ impl<'a, 'tcx> InferCtxtExt<'tcx> for InferCtxt<'a, 'tcx> {
                                             if expected.len() == 1 { "" } else { "s" },
                                         )
                                     );
-                                } else if !same_type_modulo_infer(given_ty, expected_ty) {
+                                } else if !self.same_type_modulo_infer(given_ty, expected_ty) {
                                     // Print type mismatch
                                     let (expected_args, given_args) =
                                         self.cmp(given_ty, expected_ty);
@@ -789,24 +788,9 @@ impl<'a, 'tcx> InferCtxtExt<'tcx> for InferCtxt<'a, 'tcx> {
                         span_bug!(span, "coerce requirement gave wrong error: `{:?}`", predicate)
                     }
 
-                    ty::PredicateKind::RegionOutlives(predicate) => {
-                        let predicate = bound_predicate.rebind(predicate);
-                        let predicate = self.resolve_vars_if_possible(predicate);
-                        let err = self
-                            .region_outlives_predicate(&obligation.cause, predicate)
-                            .err()
-                            .unwrap();
-                        struct_span_err!(
-                            self.tcx.sess,
-                            span,
-                            E0279,
-                            "the requirement `{}` is not satisfied (`{}`)",
-                            predicate,
-                            err,
-                        )
-                    }
-
-                    ty::PredicateKind::Projection(..) | ty::PredicateKind::TypeOutlives(..) => {
+                    ty::PredicateKind::RegionOutlives(..)
+                    | ty::PredicateKind::Projection(..)
+                    | ty::PredicateKind::TypeOutlives(..) => {
                         let predicate = self.resolve_vars_if_possible(obligation.predicate);
                         struct_span_err!(
                             self.tcx.sess,
@@ -2104,6 +2088,98 @@ impl<'a, 'tcx> InferCtxtPrivExt<'a, 'tcx> for InferCtxt<'a, 'tcx> {
                         );
                     }
                 }
+
+                if let (Some(body_id), Some(ty::subst::GenericArgKind::Type(_))) =
+                    (body_id, subst.map(|subst| subst.unpack()))
+                {
+                    struct FindExprBySpan<'hir> {
+                        span: Span,
+                        result: Option<&'hir hir::Expr<'hir>>,
+                    }
+
+                    impl<'v> hir::intravisit::Visitor<'v> for FindExprBySpan<'v> {
+                        fn visit_expr(&mut self, ex: &'v hir::Expr<'v>) {
+                            if self.span == ex.span {
+                                self.result = Some(ex);
+                            } else {
+                                hir::intravisit::walk_expr(self, ex);
+                            }
+                        }
+                    }
+
+                    let mut expr_finder = FindExprBySpan { span, result: None };
+
+                    expr_finder.visit_expr(&self.tcx.hir().body(body_id).value);
+
+                    if let Some(hir::Expr {
+                        kind: hir::ExprKind::Path(hir::QPath::Resolved(None, path)), .. }
+                    ) = expr_finder.result
+                        && let [
+                            ..,
+                            trait_path_segment @ hir::PathSegment {
+                                res: Some(rustc_hir::def::Res::Def(rustc_hir::def::DefKind::Trait, trait_id)),
+                                ..
+                            },
+                            hir::PathSegment {
+                                ident: assoc_item_name,
+                                res: Some(rustc_hir::def::Res::Def(_, item_id)),
+                                ..
+                            }
+                        ] = path.segments
+                        && data.trait_ref.def_id == *trait_id
+                        && self.tcx.trait_of_item(item_id) == Some(*trait_id)
+                        && !self.is_tainted_by_errors()
+                    {
+                        let (verb, noun) = match self.tcx.associated_item(item_id).kind {
+                            ty::AssocKind::Const => ("refer to the", "constant"),
+                            ty::AssocKind::Fn => ("call", "function"),
+                            ty::AssocKind::Type => ("refer to the", "type"), // this is already covered by E0223, but this single match arm doesn't hurt here
+                        };
+
+                        // Replace the more general E0283 with a more specific error
+                        err.cancel();
+                        err = self.tcx.sess.struct_span_err_with_code(
+                            span,
+                            &format!(
+                                "cannot {verb} associated {noun} on trait without specifying the corresponding `impl` type",
+                             ),
+                            rustc_errors::error_code!(E0790),
+                        );
+
+                        if let Some(local_def_id) = data.trait_ref.def_id.as_local()
+                            && let Some(hir::Node::Item(hir::Item { ident: trait_name, kind: hir::ItemKind::Trait(_, _, _, _, trait_item_refs), .. })) = self.tcx.hir().find_by_def_id(local_def_id)
+                            && let Some(method_ref) = trait_item_refs.iter().find(|item_ref| item_ref.ident == *assoc_item_name) {
+                            err.span_label(method_ref.span, format!("`{}::{}` defined here", trait_name, assoc_item_name));
+                        }
+
+                        err.span_label(span, format!("cannot {verb} associated {noun} of trait"));
+
+                        let trait_impls = self.tcx.trait_impls_of(data.trait_ref.def_id);
+
+                        if trait_impls.blanket_impls().is_empty()
+                            && let Some((impl_ty, _)) = trait_impls.non_blanket_impls().iter().next()
+                            && let Some(impl_def_id) = impl_ty.def() {
+                            let message = if trait_impls.non_blanket_impls().len() == 1 {
+                                "use the fully-qualified path to the only available implementation".to_string()
+                            } else {
+                                format!(
+                                    "use a fully-qualified path to a specific available implementation ({} found)",
+                                    trait_impls.non_blanket_impls().len()
+                                )
+                            };
+
+                            err.multipart_suggestion(
+                                message,
+                                vec![
+                                    (trait_path_segment.ident.span.shrink_to_lo(), format!("<{} as ", self.tcx.def_path(impl_def_id).to_string_no_crate_verbose())),
+                                    (trait_path_segment.ident.span.shrink_to_hi(), format!(">"))
+                                ],
+                                Applicability::MaybeIncorrect
+                            );
+                        }
+                    }
+                };
+
                 err
             }
 

@@ -239,17 +239,36 @@ impl<'tcx> InferCtxtInner<'tcx> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DefiningAnchor {
+    /// `DefId` of the item.
+    Bind(LocalDefId),
+    /// When opaque types are not resolved, we `Bubble` up, meaning
+    /// return the opaque/hidden type pair from query, for caller of query to handle it.
+    Bubble,
+    /// Used to catch type mismatch errors when handling opaque types.
+    Error,
+}
+
 pub struct InferCtxt<'a, 'tcx> {
     pub tcx: TyCtxt<'tcx>,
 
     /// The `DefId` of the item in whose context we are performing inference or typeck.
     /// It is used to check whether an opaque type use is a defining use.
     ///
-    /// If it is `None`, we can't resolve opaque types here and need to bubble up
+    /// If it is `DefiningAnchor::Bubble`, we can't resolve opaque types here and need to bubble up
     /// the obligation. This frequently happens for
     /// short lived InferCtxt within queries. The opaque type obligations are forwarded
     /// to the outside until the end up in an `InferCtxt` for typeck or borrowck.
-    pub defining_use_anchor: Option<LocalDefId>,
+    ///
+    /// It is default value is `DefiningAnchor::Error`, this way it is easier to catch errors that
+    /// might come up during inference or typeck.
+    pub defining_use_anchor: DefiningAnchor,
+
+    /// Whether this inference context should care about region obligations in
+    /// the root universe. Most notably, this is used during hir typeck as region
+    /// solving is left to borrowck instead.
+    pub considering_regions: bool,
 
     /// During type-checking/inference of a body, `in_progress_typeck_results`
     /// contains a reference to the typeck results being built up, which are
@@ -525,8 +544,9 @@ impl<'tcx> fmt::Display for FixupError<'tcx> {
 /// without using `Rc` or something similar.
 pub struct InferCtxtBuilder<'tcx> {
     tcx: TyCtxt<'tcx>,
+    defining_use_anchor: DefiningAnchor,
+    considering_regions: bool,
     fresh_typeck_results: Option<RefCell<ty::TypeckResults<'tcx>>>,
-    defining_use_anchor: Option<LocalDefId>,
 }
 
 pub trait TyCtxtInferExt<'tcx> {
@@ -535,7 +555,12 @@ pub trait TyCtxtInferExt<'tcx> {
 
 impl<'tcx> TyCtxtInferExt<'tcx> for TyCtxt<'tcx> {
     fn infer_ctxt(self) -> InferCtxtBuilder<'tcx> {
-        InferCtxtBuilder { tcx: self, defining_use_anchor: None, fresh_typeck_results: None }
+        InferCtxtBuilder {
+            tcx: self,
+            defining_use_anchor: DefiningAnchor::Error,
+            considering_regions: true,
+            fresh_typeck_results: None,
+        }
     }
 }
 
@@ -545,7 +570,7 @@ impl<'tcx> InferCtxtBuilder<'tcx> {
     /// Will also change the scope for opaque type defining use checks to the given owner.
     pub fn with_fresh_in_progress_typeck_results(mut self, table_owner: LocalDefId) -> Self {
         self.fresh_typeck_results = Some(RefCell::new(ty::TypeckResults::new(table_owner)));
-        self.with_opaque_type_inference(table_owner)
+        self.with_opaque_type_inference(DefiningAnchor::Bind(table_owner))
     }
 
     /// Whenever the `InferCtxt` should be able to handle defining uses of opaque types,
@@ -554,8 +579,13 @@ impl<'tcx> InferCtxtBuilder<'tcx> {
     /// It is only meant to be called in two places, for typeck
     /// (via `with_fresh_in_progress_typeck_results`) and for the inference context used
     /// in mir borrowck.
-    pub fn with_opaque_type_inference(mut self, defining_use_anchor: LocalDefId) -> Self {
-        self.defining_use_anchor = Some(defining_use_anchor);
+    pub fn with_opaque_type_inference(mut self, defining_use_anchor: DefiningAnchor) -> Self {
+        self.defining_use_anchor = defining_use_anchor;
+        self
+    }
+
+    pub fn ignoring_regions(mut self) -> Self {
+        self.considering_regions = false;
         self
     }
 
@@ -583,11 +613,17 @@ impl<'tcx> InferCtxtBuilder<'tcx> {
     }
 
     pub fn enter<R>(&mut self, f: impl for<'a> FnOnce(InferCtxt<'a, 'tcx>) -> R) -> R {
-        let InferCtxtBuilder { tcx, defining_use_anchor, ref fresh_typeck_results } = *self;
+        let InferCtxtBuilder {
+            tcx,
+            defining_use_anchor,
+            considering_regions,
+            ref fresh_typeck_results,
+        } = *self;
         let in_progress_typeck_results = fresh_typeck_results.as_ref();
         f(InferCtxt {
             tcx,
             defining_use_anchor,
+            considering_regions,
             in_progress_typeck_results,
             inner: RefCell::new(InferCtxtInner::new()),
             lexical_region_resolutions: RefCell::new(None),
@@ -938,7 +974,7 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
     #[instrument(skip(self), level = "debug")]
     pub fn member_constraint(
         &self,
-        opaque_type_def_id: DefId,
+        opaque_type_def_id: LocalDefId,
         definition_span: Span,
         hidden_ty: Ty<'tcx>,
         region: ty::Region<'tcx>,
@@ -1025,16 +1061,11 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
         &self,
         cause: &traits::ObligationCause<'tcx>,
         predicate: ty::PolyRegionOutlivesPredicate<'tcx>,
-    ) -> UnitResult<'tcx> {
-        self.commit_if_ok(|_snapshot| {
-            let ty::OutlivesPredicate(r_a, r_b) =
-                self.replace_bound_vars_with_placeholders(predicate);
-            let origin = SubregionOrigin::from_obligation_cause(cause, || {
-                RelateRegionParamBound(cause.span)
-            });
-            self.sub_regions(origin, r_b, r_a); // `b : a` ==> `a <= b`
-            Ok(())
-        })
+    ) {
+        let ty::OutlivesPredicate(r_a, r_b) = self.replace_bound_vars_with_placeholders(predicate);
+        let origin =
+            SubregionOrigin::from_obligation_cause(cause, || RelateRegionParamBound(cause.span));
+        self.sub_regions(origin, r_b, r_a); // `b : a` ==> `a <= b`
     }
 
     /// Number of type variables created so far.

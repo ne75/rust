@@ -4,7 +4,13 @@
 // min-lldb-version: 310
 // min-gdb-version: 8.0
 
+// revisions: lto no-lto
+
 // compile-flags:-g
+
+// [lto] compile-flags:-C lto
+// [lto] no-prefer-dynamic
+
 // gdb-command:run
 // gdbg-command:print 'basic_types_globals::B'
 // gdbr-command:print B
@@ -13,7 +19,7 @@
 // gdbr-command:print I
 // gdb-check:$2 = -1
 // gdbg-command:print 'basic_types_globals::C'
-// gdbr-command:print C
+// gdbr-command:print/d C
 // gdbg-check:$3 = 97
 // gdbr-check:$3 = 97
 // gdbg-command:print/d 'basic_types_globals::I8'

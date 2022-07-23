@@ -1269,7 +1269,7 @@ pub trait PrettyPrinter<'tcx>:
                 if let ty::Array(elem, len) = inner.kind() {
                     if let ty::Uint(ty::UintTy::U8) = elem.kind() {
                         if let ty::ConstKind::Value(ty::ValTree::Leaf(int)) = len.kind() {
-                            match self.tcx().get_global_alloc(alloc_id) {
+                            match self.tcx().try_get_global_alloc(alloc_id) {
                                 Some(GlobalAlloc::Memory(alloc)) => {
                                     let len = int.assert_bits(self.tcx().data_layout.pointer_size);
                                     let range =
@@ -1282,11 +1282,12 @@ pub trait PrettyPrinter<'tcx>:
                                         p!("<too short allocation>")
                                     }
                                 }
-                                // FIXME: for statics and functions, we could in principle print more detail.
+                                // FIXME: for statics, vtables, and functions, we could in principle print more detail.
                                 Some(GlobalAlloc::Static(def_id)) => {
                                     p!(write("<static({:?})>", def_id))
                                 }
                                 Some(GlobalAlloc::Function(_)) => p!("<function>"),
+                                Some(GlobalAlloc::VTable(..)) => p!("<vtable>"),
                                 None => p!("<dangling pointer>"),
                             }
                             return Ok(self);
@@ -1297,7 +1298,8 @@ pub trait PrettyPrinter<'tcx>:
             ty::FnPtr(_) => {
                 // FIXME: We should probably have a helper method to share code with the "Byte strings"
                 // printing above (which also has to handle pointers to all sorts of things).
-                if let Some(GlobalAlloc::Function(instance)) = self.tcx().get_global_alloc(alloc_id)
+                if let Some(GlobalAlloc::Function(instance)) =
+                    self.tcx().try_get_global_alloc(alloc_id)
                 {
                     self = self.typed_value(
                         |this| this.print_value_path(instance.def_id(), instance.substs),
@@ -1377,9 +1379,9 @@ pub trait PrettyPrinter<'tcx>:
 
     /// This is overridden for MIR printing because we only want to hide alloc ids from users, not
     /// from MIR where it is actually useful.
-    fn pretty_print_const_pointer<Tag: Provenance>(
+    fn pretty_print_const_pointer<Prov: Provenance>(
         mut self,
-        _: Pointer<Tag>,
+        _: Pointer<Prov>,
         ty: Ty<'tcx>,
         print_ty: bool,
     ) -> Result<Self::Const, Self::Error> {
@@ -1727,7 +1729,7 @@ impl<'tcx> Printer<'tcx> for FmtPrinter<'_, 'tcx> {
     }
 
     fn print_const(self, ct: ty::Const<'tcx>) -> Result<Self::Const, Self::Error> {
-        self.pretty_print_const(ct, true)
+        self.pretty_print_const(ct, false)
     }
 
     fn path_crate(mut self, cnum: CrateNum) -> Result<Self::Path, Self::Error> {
@@ -1952,9 +1954,9 @@ impl<'tcx> PrettyPrinter<'tcx> for FmtPrinter<'_, 'tcx> {
         }
     }
 
-    fn pretty_print_const_pointer<Tag: Provenance>(
+    fn pretty_print_const_pointer<Prov: Provenance>(
         self,
-        p: Pointer<Tag>,
+        p: Pointer<Prov>,
         ty: Ty<'tcx>,
         print_ty: bool,
     ) -> Result<Self::Const, Self::Error> {

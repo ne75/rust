@@ -230,9 +230,9 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for ConstPropMachine<'mir, 'tcx>
     }
 
     fn access_local<'a>(
-        frame: &'a Frame<'mir, 'tcx, Self::PointerTag, Self::FrameExtra>,
+        frame: &'a Frame<'mir, 'tcx, Self::Provenance, Self::FrameExtra>,
         local: Local,
-    ) -> InterpResult<'tcx, &'a interpret::Operand<Self::PointerTag>> {
+    ) -> InterpResult<'tcx, &'a interpret::Operand<Self::Provenance>> {
         let l = &frame.locals[local];
 
         if matches!(
@@ -251,7 +251,7 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for ConstPropMachine<'mir, 'tcx>
         ecx: &'a mut InterpCx<'mir, 'tcx, Self>,
         frame: usize,
         local: Local,
-    ) -> InterpResult<'tcx, &'a mut interpret::Operand<Self::PointerTag>> {
+    ) -> InterpResult<'tcx, &'a mut interpret::Operand<Self::Provenance>> {
         if ecx.machine.can_const_prop[local] == ConstPropMode::NoPropagation {
             throw_machine_stop_str!("tried to write to a local that is marked as not propagatable")
         }
@@ -270,7 +270,7 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for ConstPropMachine<'mir, 'tcx>
         _tcx: TyCtxt<'tcx>,
         _machine: &Self,
         _alloc_id: AllocId,
-        alloc: ConstAllocation<'tcx, Self::PointerTag, Self::AllocExtra>,
+        alloc: ConstAllocation<'tcx, Self::Provenance, Self::AllocExtra>,
         _static_def_id: Option<DefId>,
         is_write: bool,
     ) -> InterpResult<'tcx> {
@@ -305,14 +305,14 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for ConstPropMachine<'mir, 'tcx>
     #[inline(always)]
     fn stack<'a>(
         ecx: &'a InterpCx<'mir, 'tcx, Self>,
-    ) -> &'a [Frame<'mir, 'tcx, Self::PointerTag, Self::FrameExtra>] {
+    ) -> &'a [Frame<'mir, 'tcx, Self::Provenance, Self::FrameExtra>] {
         &ecx.machine.stack
     }
 
     #[inline(always)]
     fn stack_mut<'a>(
         ecx: &'a mut InterpCx<'mir, 'tcx, Self>,
-    ) -> &'a mut Vec<Frame<'mir, 'tcx, Self::PointerTag, Self::FrameExtra>> {
+    ) -> &'a mut Vec<Frame<'mir, 'tcx, Self::Provenance, Self::FrameExtra>> {
         &mut ecx.machine.stack
     }
 }
@@ -584,7 +584,7 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
         });
         // Check for exceeding shifts *even if* we cannot evaluate the LHS.
         if op == BinOp::Shr || op == BinOp::Shl {
-            let r = r?;
+            let r = r.clone()?;
             // We need the type of the LHS. We cannot use `place_layout` as that is the type
             // of the result, which for checked binops is not the same!
             let left_ty = left.ty(self.local_decls, self.tcx);
@@ -616,10 +616,10 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
             }
         }
 
-        if let (Some(l), Some(r)) = (&l, &r) {
+        if let (Some(l), Some(r)) = (l, r) {
             // The remaining operators are handled through `overflowing_binary_op`.
             if self.use_ecx(source_info, |this| {
-                let (_res, overflow, _ty) = this.ecx.overflowing_binary_op(op, l, r)?;
+                let (_res, overflow, _ty) = this.ecx.overflowing_binary_op(op, &l, &r)?;
                 Ok(overflow)
             })? {
                 self.report_assert_as_lint(

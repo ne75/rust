@@ -26,6 +26,7 @@ mod wasm;
 mod x86;
 mod x86_64;
 mod x86_win64;
+mod p2;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, HashStable_Generic)]
 pub enum PassMode {
@@ -714,6 +715,7 @@ impl<'a, Ty> FnAbi<'a, Ty> {
             }
             "asmjs" => wasm::compute_c_abi_info(cx, self),
             "bpf" => bpf::compute_abi_info(self),
+            "p2" => p2::compute_abi_info(self),
             arch => {
                 return Err(AdjustForForeignAbiError::Unsupported {
                     arch: Symbol::intern(arch),
